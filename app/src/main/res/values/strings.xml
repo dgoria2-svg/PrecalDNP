@@ -1,0 +1,224 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- App / básicos -->
+    <string name="app_name">Precal DNP</string>
+    <string name="ok">OK</string>
+    <string name="na">—</string>
+    <string name="nd">N/D</string>
+
+    <!-- Welcome -->
+    <string name="welcome_title">Precal DNP</string>
+    <string name="welcome_sub">Mediremos el trazado del contorno del lente y DNP usando IA</string>
+    <string name="btn_ver_instr">Ver instrucciones</string>
+    <string name="btn_continuar">Continuar</string>
+    <string name="btn_aceptar_y_continuar">Aceptar y continuar</string>
+
+    <!-- Instrucciones + acciones PDF -->
+    <string name="instr_title">Instrucciones (resumen)</string>
+    <string name="instr_body">
+Imprima la guía A4 al 100 % (círculo 75 mm). Verifique que la medida guía (50 mm) esté en escala. Coloque la Demolens dentro del círculo y tome la foto. La app usará esa referencia para trazar la forma. Es muy importante utilizar iluminación indirecta, evitando reflejos. Luces o sombras sobre la Demolens no permiten su trazado. Considere verificar la información visible en relación a la Demolens para chequear sus medidas y corrija, de ser necesario, la correcta orientación horizontal con el ajuste del eje en la barra deslizable. Podra luego Medir DNP altura de centrado, puente y diametro util necesario para procesar la  lente.
+    </string>
+
+    <!-- Botones de instrucciones -->
+    <string name="instr_open_drive">Abrir en Drive</string>
+    <string name="instr_download_pdf">Ver / imprimir PDF</string>
+    <string name="instr_share_link">Compartir link</string>
+    <string name="instr_share_pdf">Compartir PDF</string>
+    <string name="instr_back">Volver</string>
+    <string name="instr_accept">Aceptar</string>
+
+    <!-- Texto / descripciones PDF -->
+    <string name="instr_download_desc">Instrucciones de Precal Demolens</string>
+
+    <!-- Mensajes descarga (por si más adelante se vuelve a usar Drive/DownloadManager) -->
+    <string name="instr_downloading">Descargando PDF…</string>
+    <string name="instr_download_done">Descarga completa</string>
+    <string name="instr_download_failed">No se pudo descargar el PDF</string>
+
+    <!-- Títulos para chooser / compartir -->
+    <string name="instr_share_link_chooser">Compartir link</string>
+    <string name="instr_share_pdf_chooser">Compartir PDF</string>
+    <!-- Por compatibilidad con código anterior que usaba instr_share_title -->
+    <string name="instr_share_title">Compartir PDF</string>
+
+    <!-- Errores / toasts relacionados con PDF -->
+    <string name="error_sin_app_pdf">No hay ninguna app para abrir el PDF.</string>
+    <string name="error_abrir_pdf">No se pudo abrir la guía de calibración.</string>
+    <string name="instr_pdf_prepare_error">No se pudo preparar el PDF local.</string>
+    <string name="instr_pdf_no_viewer">No hay app para abrir PDF en este equipo. Podés compartirlo desde el botón de abajo.</string>
+
+    <!-- Mensajes genéricos / permisos / captura -->
+    <string name="msg_permiso_cam">Se requiere permiso de cámara</string>
+    <string name="msg_error_captura">Error en la captura</string>
+
+    <!-- Términos -->
+    <string name="terms_title">Términos y condiciones</string>
+    <string name="terms_message">Para usar Precal Demolens aceptás los términos del servicio y el tratamiento de imágenes sólo con fines de medición local en este dispositivo.</string>
+    <string name="terms_accept">Acepto</string>
+    <string name="terms_exit">Salir</string>
+
+    <!-- Captura (StillCapture) -->
+    <string name="capture_title">Captura única (círculo 75)</string>
+    <string name="btn_capturar">Capturar</string>
+    <string name="precal_processing">Procesando trazado…</string>
+    <string name="msg_error_load_photo">Error al cargar la foto.</string>
+    <string name="precal_toast_no_ref75">No se detectó la guía de 75 mm.</string>
+    <string name="precal_toast_trace_fail">No se pudo trazar la lente.</string>
+    <string name="cd_overlay_circle_75">Guía de círculo de referencia 75 mm</string>
+    <string name="cd_btn_capture">Botón de captura</string>
+
+    <!-- Resultados (Precal) -->
+    <string name="results_precal_title">Resultados</string>
+    <string name="results_precal_sub">Previsualizá el trazado y exportá el trazado</string>
+    <string name="precal_result_photo_desc">Foto capturada para trazado</string>
+    <string name="precal_status_ok">Trazado OK</string>
+    <string name="precal_status_missing">Sin trazado</string>
+    <string name="precal_calculando_preview">Calculando comparación…</string>
+
+    <!-- Métricas -->
+    <string name="precal_metrics_placeholder">—</string>
+    <string name="precal_rotate_label">Rotación del eje</string>
+    <string name="precal_order_label">Número de orden (sólo números)</string>
+    <string name="precal_order_hint">Ej: 123456</string>
+
+    <string name="precal_status_ok_metrics_circ">Trazado OK – HBOX %1$.2f mm · VBOX %2$.2f mm · EYESIZ %3$.2f mm · θ %4$d°</string>
+    <string name="precal_metrics">HBOX %1$.2f  VBOX %2$.2f  FED %3$.2f • px/mm %4$.3f • src %5$d×%6$d</string>
+    <string name="precal_status_trace">Trazado OK – HBOX %1$.2f mm · VBOX %2$.2f mm · FED %3$.2f mm</string>
+    <string name="precal_src_px">Fuente: %1$d×%2$d px</string>
+    <string name="precal_pxmm">Calibración: %1$.2f px/mm</string>
+    <string name="precal_sharpness">Nitidez: %1$.2f</string>
+
+    <!-- Botones / acciones resultados -->
+    <string name="precal_btn_save">Guardar</string>
+    <string name="precal_btn_share">Compartir</string>
+    <string name="btn_volver">Volver</string>
+    <string name="share_title">Compartir</string>
+    <string name="trace_share_title">Compartir trazado</string>
+
+    <!-- Toasts / chooser resultados -->
+    <string name="precal_toast_missing_trace">No tengo datos de trazado</string>
+    <string name="precal_toast_invalid_order">Número de orden inválido</string>
+    <string name="precal_toast_saved_ok">Trazado guardado</string>
+    <string name="precal_toast_saved_error">Error al guardar trazado</string>
+    <string name="precal_share_chooser">Compartir trazado</string>
+
+    <!-- Guardado / compartir genérico -->
+    <string name="file_saved">Trazado guardado</string>
+    <string name="saved_ok">Guardado</string>
+    <string name="saved_error">Error al guardar</string>
+    <string name="results_save_error">Error al guardar resultados</string>
+    <string name="results_saved_ok">Resultados guardados</string>
+    <string name="results_share_error">Error al compartir resultados</string>
+    <string name="results_share_text_ext">Trazado del armazón</string>
+    <string name="no_image_to_share">No hay imagen para compartir</string>
+
+    <!-- Menú / navegación -->
+    <string name="menu_title">Menú</string>
+    <string name="menu_measure">Tomar foto DNP</string>
+    <string name="menu_recalibrate">Recalibrar</string>
+    <string name="menu_status_ok">OK</string>
+    <string name="menu_status_pending">Pendiente</string>
+
+    <!-- Accesibilidad -->
+    <string name="annotated_preview_cd">Imagen anotada</string>
+    <string name="imagen_anotada">Imagen anotada</string>
+    <string name="preview_desc">Vista previa de la cámara</string>
+    <string name="annotated_img_desc">Imagen anotada</string>
+    <string name="results_img_desc">Imagen de resultados</string>
+    <string name="results_image_cd">results_image</string>
+    <string name="cd_app_icon">Ícono de la app Precal Demolens</string>
+
+    <!-- Otros -->
+    <string name="accept_button">Aceptar</string>
+    <string name="aceptar">Aceptar</string>
+    <string name="btn_back_menu">Volver al menú</string>
+    <string name="btn_save">Guardar</string>
+    <string name="btn_menu">Menú</string>
+    <string name="btn_close">Cerrar</string>
+    <string name="hint_order">Ingresá número de pedido</string>
+    <string name="info">—</string>
+    <string name="trace_ready">Trazado listo</string>
+    <string name="precal_processing_error">Error al procesar trazado</string>
+    <string name="trace_share_error">Error al compartir trazado</string>
+    <string name="trace_save_error">Error al guardar trazado</string>
+    <string name="precal_captured_image">Imagen Trazado</string>
+    <string name="capture_hint">Alineá el aro con el círculo de 100 mm; la barra de 100 mm debajo. Cuando esté centrado, tocá el botón para capturar.</string>
+    <string name="cd_capturar">Capturar foto para trazar la lente</string>
+
+    <!-- Precal + DNP -->
+    <string name="precal_btn_dnp">Medir en cara (DNP)</string>
+    <string name="dnp_toast_missing_trace">Falta el trazado para continuar con DNP.</string>
+    <string name="dnp_toast_save_fil_first">Primero guardá el trazado antes de medir en cara.</string>
+    <string name="dnp_toast_missing_data">Faltan datos para medir en cara.</string>
+    <string name="dnp_face_info_body">DNP – captura de cara\n\n Orden: %1$s\n FIL: %2$s\n Puntos contorno: %3$d\n px/mm (Precal): %4$.3f</string>
+    <string name="dnp_camera_permission_required">Se necesita la cámara para capturar la cara del paciente.</string>
+
+    <string name="dnp_face_hint">Colocá al paciente a 1 mt, con mirada al frente. Cuando veas el aro calzado con el contorno verde, captura.</string>
+    <string name="dnp_face_cd_capture">Capturar foto de cara</string>
+    <string name="dnp_face_order_label">Orden: %1$s</string>
+    <string name="dnp_face_fil_label">FIL: %1$s</string>
+    <string name="dnp_face_points_label">Puntos contorno: %1$d</string>
+    <string name="dnp_face_pxmm_label">px/mm (Precal): %1$.3f</string>
+    <string name="dnp_face_last_photo_label">Última foto guardada: %1$s</string>
+    <string name="dnp_face_capture_error">Error al capturar foto: %1$s</string>
+    <string name="dnp_face_capture_no_uri">No se pudo obtener la URI de la foto capturada.</string>
+    <string name="dnp_face_capture_ok">Foto de cara guardada en la galería: %1$s</string>
+    <string name="dnp_error_missing_data">Faltan datos para medir en cara.</string>
+    <string name="dnp_face_title">DNP – captura de cara</string>
+    <string name="dnp_face_info_order">Orden: %1$s</string>
+    <string name="dnp_face_info_fil">FIL: %1$s</string>
+    <string name="dnp_face_info_points">Puntos contorno: %1$d</string>
+    <string name="dnp_face_info_scale">px/mm (Precal): %1$.3f</string>
+    <string name="dnp_face_debug_placeholder">
+        Acá se va a mostrar la información de la lente y la escala (modo debug).
+    </string>
+
+    <!-- DNP – captura a 2 m en landscape -->
+    <string name="dnp_face_hint_2m_landscape">
+        Colocá al paciente a unos 2 m de la cámara,y asegurate que la cara entre completa en pantalla.
+    </string>
+    <string name="dnp_face_processing_label">Procesando medición DNP…</string>
+    <string name="dnp_face_measure_error">No se pudo calcular la medición. Volvé a intentar con otra foto.</string>
+    <string name="dnp_face_measure_ok_fmt">
+        DNP OD: %.1f  OI: %.1f mm · Alt OD: %.1f  OI: %.1f mm
+    </string>
+    <string name="results_line_dnp_total_fmt">DNP total: %1$s mm</string>
+    <string name="dnp_capturing_best_frames">Capturando…</string>
+    <string name="results_line_fil_fmt">FIL HBOX:%1$s VBOX:%2$s DBL:%3$s EYESIZ:%4$s CIRC:%5$s (mm)</string>
+    <string name="results_line_scale_arcfit_fmt">Escala:%1$s px/mm · ArcFit rot:%2$s° rms:%3$s px (n=%4$d)</string>
+
+
+
+    <!-- Resultados DNP / métricas -->
+    <string name="metricas">Métricas de la medición</string>
+    <string name="results_missing">No hay resultados para mostrar.</string>
+    <string name="results_line_main_fmt">  A: %1$s mm   B: %2$s mm   Diag: %3$s mm</string>
+    <string name="results_line_bridge_fmt"> Puente: %1$s mm</string>
+    <string name="results_line_dnp_fmt"> DNP OD: %1$s mm   OI: %2$s mm</string>
+    <string name="results_line_alt_fmt"> Alturas  OD: %1$s mm   OI: %2$s mm</string>
+    <string name="results_line_diam_fmt"> Diam. útil  OD: %1$s mm   OI: %2$s mm</string>
+    <string name="share_annotated_title">Compartir imagen anotada</string>
+    <string name="calculando_con_ia_sus_medidas">Calculando con IA sus medidas…</string>
+    <!-- DNP / 3250 -->
+    <string name="dnp_missing_inputs">Faltan entradas para medir (imagen o FIL).</string>
+    <string name="dnp_cannot_read_fil">No se pudo leer el archivo .FIL.</string>
+    <string name="dnp_camera_start_failed">No se pudo iniciar la cámara.</string>
+    <string name="dnp_overlay_not_ready">Overlay aún no está listo.</string>
+    <string name="dnp_overlay_missing_box">Falta el encuadre del ojo en el overlay.</string>
+    <string name="dnp_capture_failed">Falló la captura: %1$s</string>
+    <string name="dnp_capture_no_uri">Captura sin URI de salida.</string>
+    <string name="dnp_measure_failed">Falló la medición.</string>
+    <string name="dnp_measure_ok">Medición realizada.</string>
+    <string name="dnp_measure_error">Error al medir.</string>
+    <string name="dnp_wait_stability">Estabilizando… mantené quieto 2 s</string>
+    <string name="dnp_stage_rim_detecting">Detectando aro…</string>
+    <string name="dnp_stage_arc_fit">Ajustando FIL…</string>
+    <string name="dnp_stage_sampler">Refinando ajuste…</string>
+    <string name="dnp_stage_debug">Generando debug…</string>
+
+
+
+
+
+</resources>

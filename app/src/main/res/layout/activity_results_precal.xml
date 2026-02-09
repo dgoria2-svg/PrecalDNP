@@ -1,0 +1,192 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/rootResultsPrecal"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    tools:context="com.dg.precaldnp.ui.ResultsPrecalActivity">
+
+    <!-- Zona de preview: foto + trazos -->
+    <FrameLayout
+        android:id="@+id/framePreview"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:background="@android:color/black"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toTopOf="@id/tvMetrics"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
+
+        <!-- Foto capturada -->
+        <ImageView
+            android:id="@+id/ivPhoto"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:scaleType="fitCenter"
+            android:adjustViewBounds="true"
+            tools:src="@drawable/ic_launcher_background" />
+
+        <!-- Trazo rojo del contorno detectado -->
+        <com.dg.precaldnp.ui.PrecalLineView
+            android:id="@+id/traceView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:clickable="false"
+            android:focusable="false" />
+
+        <!-- Vista de comparación del .FIL (forma al lado de la otra) -->
+        <com.dg.precaldnp.ui.CompareLineView
+            android:id="@+id/compareView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:clickable="false"
+            android:focusable="false"
+            android:visibility="visible" />
+
+        <!-- Pensador: overlay semitransparente con spinner y texto -->
+        <LinearLayout
+            android:id="@+id/panelThinking"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:gravity="center"
+            android:orientation="vertical"
+            android:background="#80000000"
+            android:visibility="gone">
+
+            <ProgressBar
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content" />
+
+            <TextView
+                android:id="@+id/tvThinking"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/precal_calculando_preview"
+                android:textColor="@android:color/white" />
+        </LinearLayout>
+
+        <!-- Botón DNP sobre la imagen (abajo a la derecha) -->
+        <Button
+            android:id="@+id/btnDnp"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_margin="16dp"
+            android:background="@drawable/btn_dnp_primary"
+            android:text="@string/precal_btn_dnp"
+            android:textColor="@android:color/white"
+            android:textAllCaps="false"
+            android:enabled="true"
+            android:paddingHorizontal="16dp"
+            android:paddingVertical="8dp"
+            android:layout_gravity="bottom|end" />
+
+    </FrameLayout>
+
+    <!-- Estado / métricas -->
+    <TextView
+        android:id="@+id/tvMetrics"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginHorizontal="16dp"
+        android:layout_marginTop="8dp"
+        android:text="@string/precal_status_ok"
+        android:textAppearance="?attr/textAppearanceBodyMedium"
+        app:layout_constraintTop_toBottomOf="@id/framePreview"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        tools:text="HBOX 52.3 · VBOX 40.1 · CIRC 55.0 · eje 0°" />
+
+    <!-- Rotador del FIL -->
+    <LinearLayout
+        android:id="@+id/layoutRotate"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginHorizontal="16dp"
+        android:layout_marginTop="8dp"
+        android:orientation="vertical"
+        app:layout_constraintTop_toBottomOf="@id/tvMetrics"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
+
+        <TextView
+            android:id="@+id/tvRotateLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/precal_rotate_label"
+            android:textAppearance="?attr/textAppearanceBodySmall" />
+
+        <SeekBar
+            android:id="@+id/seekRotate"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content" />
+    </LinearLayout>
+
+    <!-- Número de orden -->
+    <EditText
+        android:id="@+id/etOrderNumber"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginHorizontal="16dp"
+        android:layout_marginTop="8dp"
+        android:autofillHints="1234"
+        android:hint="@string/precal_order_label"
+        android:inputType="number"
+        android:minHeight="48dp"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/layoutRotate" />
+
+    <!-- Botonera inferior -->
+    <LinearLayout
+        android:id="@+id/layoutButtons"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginHorizontal="16dp"
+        android:layout_marginTop="12dp"
+        android:layout_marginBottom="16dp"
+        android:orientation="horizontal"
+        android:gravity="center"
+        app:layout_constraintTop_toBottomOf="@id/etOrderNumber"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent">
+
+        <Button
+            android:id="@+id/btnSaveFil"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:background="@drawable/btn_primary"
+            android:textColor="@android:color/white"
+            android:paddingVertical="10dp"
+            android:text="@string/precal_btn_save"
+            android:enabled="false" />
+
+        <Button
+            android:id="@+id/btnShareFil"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:layout_weight="1"
+            android:background="@drawable/btn_primary"
+            android:textColor="@android:color/white"
+            android:paddingVertical="10dp"
+            android:text="@string/precal_btn_share"
+            android:enabled="false" />
+
+        <Button
+            android:id="@+id/btnMenu"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:layout_weight="1"
+            android:background="@drawable/btn_outline"
+            android:textColor="?attr/colorPrimary"
+            android:paddingVertical="10dp"
+            android:text="@string/btn_volver" />
+    </LinearLayout>
+
+</androidx.constraintlayout.widget.ConstraintLayout>

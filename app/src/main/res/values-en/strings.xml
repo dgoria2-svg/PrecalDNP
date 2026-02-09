@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- App / basic -->
+    <string name="app_name">Precal Demolens</string>
+    <string name="ok">OK</string>
+    <string name="na">—</string>
+    <string name="nd">N/A</string>
+
+    <!-- Welcome -->
+    <string name="welcome_title">Precal Demolens</string>
+    <string name="welcome_sub">Single capture: 75 mm circle → trace shape → save trace</string>
+    <string name="btn_ver_instr">View instructions</string>
+    <string name="btn_continuar">Continue</string>
+    <string name="btn_aceptar_y_continuar">Accept and continue</string>
+
+    <!-- Instructions + PDF actions -->
+    <string name="instr_title">Instructions (summary)</string>
+    <string name="instr_body">
+Print the A4 guide at 100% (75 mm circle). Check that the reference bar (50 mm) is to scale. Place the Demolens inside the circle and take the photo. The app will use that reference to trace the shape. It is very important to use indirect lighting and avoid reflections. Lights or shadows on the Demolens prevent proper tracing. Check the visible information against the Demolens to verify the measurements and, if necessary, correct the horizontal orientation using the axis adjustment slider.
+    </string>
+
+    <string name="instr_open_drive">Open in Drive</string>
+    <string name="instr_download_pdf">View / print PDF</string>
+    <string name="instr_share_link">Share link</string>
+    <string name="instr_share_pdf">Share PDF</string>
+    <string name="instr_back">Back</string>
+    <string name="instr_accept">Accept</string>
+    <string name="instr_download_desc">Precal Demolens instructions</string>
+
+    <!-- Download messages (if you use DownloadManager again later) -->
+    <string name="instr_downloading">Downloading PDF…</string>
+    <string name="instr_download_done">Download complete</string>
+    <string name="instr_download_failed">Could not download the PDF</string>
+
+    <!-- Chooser / share titles -->
+    <string name="instr_share_link_chooser">Share link</string>
+    <string name="instr_share_pdf_chooser">Share PDF</string>
+    <!-- Used by InstructionsActivity for the chooser title -->
+    <string name="instr_share_title">Share PDF</string>
+
+    <!-- PDF / error messages -->
+    <string name="error_sin_app_pdf">There is no app to open PDFs.</string>
+    <string name="error_abrir_pdf">Could not open the calibration guide.</string>
+    <string name="instr_pdf_prepare_error">Could not prepare local PDF.</string>
+    <string name="instr_pdf_no_viewer">There is no app to open PDFs on this device. You can share it using the button below.</string>
+
+    <!-- Generic messages / permissions / capture -->
+    <string name="msg_permiso_cam">Camera permission is required</string>
+    <string name="msg_error_captura">Capture error</string>
+
+    <!-- Terms -->
+    <string name="terms_title">Terms and conditions</string>
+    <string name="terms_message">To use Precal Demolens you accept the terms of service and that images are processed only locally on this device for measurement purposes.</string>
+    <string name="terms_accept">I accept</string>
+    <string name="terms_exit">Exit</string>
+
+    <!-- Capture (StillCapture) -->
+    <string name="capture_title">Single capture (75 mm circle)</string>
+    <string name="btn_capturar">Capture</string>
+    <string name="precal_processing">Processing trace…</string>
+    <string name="msg_error_load_photo">Error loading photo.</string>
+    <string name="precal_toast_no_ref75">75 mm guide not detected.</string>
+    <string name="precal_toast_trace_fail">Could not trace the lens.</string>
+    <string name="cd_overlay_circle_75">75 mm reference circle guide</string>
+    <string name="cd_btn_capture">Capture button</string>
+
+    <!-- Results (Precal) -->
+    <string name="results_precal_title">Results</string>
+    <string name="results_precal_sub">Preview the trace and export the .FIL</string>
+    <string name="precal_result_photo_desc">Captured photo for tracing</string>
+    <string name="precal_status_ok">Trace OK</string>
+    <string name="precal_status_missing">No trace</string>
+    <string name="precal_calculando_preview">Computing comparison…</string>
+
+    <!-- Metrics -->
+    <string name="precal_metrics_placeholder">—</string>
+    <string name="precal_rotate_label">Axis rotation</string>
+    <string name="precal_order_label">Order number (digits only)</string>
+    <string name="precal_order_hint">E.g.: 123456</string>
+
+    <string name="precal_status_ok_metrics_circ">
+Trace OK – HBOX %1$.2f mm · VBOX %2$.2f mm · EYESIZ %3$.2f mm · θ %4$d°
+    </string>
+
+    <string name="precal_metrics">
+HBOX %1$.2f  VBOX %2$.2f  FED %3$.2f • px/mm %4$.3f • src %5$d×%6$d
+    </string>
+
+    <string name="precal_status_trace">Trace OK – HBOX %1$.2f mm · VBOX %2$.2f mm · FED %3$.2f mm</string>
+    <string name="precal_src_px">Source: %1$d×%2$d px</string>
+    <string name="precal_pxmm">Calibration: %1$.2f px/mm</string>
+    <string name="precal_sharpness">Sharpness: %1$.2f</string>
+
+    <!-- Buttons / actions -->
+    <string name="precal_btn_save">Save</string>
+    <string name="precal_btn_share">Share</string>
+    <string name="btn_volver">Back</string>
+    <string name="share_title">Share</string>
+    <string name="trace_share_title">Share trace</string>
+
+    <!-- Toasts / chooser -->
+    <string name="precal_toast_missing_trace">No trace data available</string>
+    <string name="precal_toast_invalid_order">Invalid order number</string>
+    <string name="precal_toast_saved_ok">Trace saved</string>
+    <string name="precal_toast_saved_error">Error saving trace</string>
+    <string name="precal_share_chooser">Share trace</string>
+
+    <!-- Generic save / share -->
+    <string name="file_saved">Trace saved</string>
+    <string name="saved_ok">Saved</string>
+    <string name="saved_error">Error saving</string>
+    <string name="results_save_error">Error saving results</string>
+    <string name="results_saved_ok">Results saved</string>
+    <string name="results_share_error">Error sharing results</string>
+    <string name="results_share_text_ext">Frame trace</string>
+    <string name="no_image_to_share">No image to share</string>
+
+    <!-- Menu / navigation -->
+    <string name="menu_title">Menu</string>
+    <string name="menu_measure">Take photo (Still)</string>
+    <string name="menu_recalibrate">Recalibrate</string>
+    <string name="menu_status_ok">OK</string>
+    <string name="menu_status_pending">Pending</string>
+
+    <!-- Accessibility -->
+    <string name="annotated_preview_cd">Annotated image</string>
+    <string name="imagen_anotada">Annotated image</string>
+    <string name="preview_desc">Camera preview</string>
+    <string name="annotated_img_desc">Annotated image</string>
+    <string name="results_img_desc">Results image</string>
+    <string name="results_image_cd">results_image</string>
+    <string name="cd_app_icon">Precal Demolens app icon</string>
+
+    <!-- Other -->
+    <string name="accept_button">Accept</string>
+    <string name="aceptar">Accept</string>
+    <string name="btn_back_menu">Back to menu</string>
+    <string name="btn_save">Save</string>
+    <string name="btn_menu">Menu</string>
+    <string name="btn_close">Close</string>
+    <string name="hint_order">Enter order number</string>
+    <string name="info">—</string>
+    <string name="trace_ready">Trace ready</string>
+    <string name="precal_processing_error">Error processing trace</string>
+    <string name="trace_share_error">Error sharing trace</string>
+    <string name="trace_save_error">Error saving trace</string>
+    <string name="precal_captured_image">Trace image</string>
+    <string name="capture_hint">Align the ring with the 75 mm circle and the 50 mm bar below it. When it is centered, tap the button to capture.</string>
+    <string name="cd_capturar">Capture photo to trace the lens</string>
+
+</resources>

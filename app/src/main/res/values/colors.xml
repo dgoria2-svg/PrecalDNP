@@ -1,0 +1,33 @@
+<resources>
+    <!-- Paleta clara -->
+    <color name="md_primary">#006CFF</color>
+    <color name="md_on_primary">#FFFFFF</color>
+
+    <color name="md_secondary">#00BCD4</color>
+    <color name="md_on_secondary">#00363D</color>
+
+    <color name="md_surface">#FFFFFF</color>
+    <color name="md_on_surface">#1A1C1E</color>
+
+    <color name="md_background">#FFFFFF</color>
+    <color name="md_on_background">#1A1C1E</color>
+
+    <!-- 🔹 faltantes usados en layouts -->
+    <color name="md_surface_variant">#E6EAF2</color>
+    <color name="md_on_surface_variant">#41464D</color>
+    <color name="dnp_green">#4CAF50</color>
+    <color name="md_error">#B00020</color>
+    <color name="md_on_error">#FFFFFF</color>
+
+    <!-- Utilitarios -->
+    <color name="white">#FFFFFF</color>
+    <color name="black">#000000</color>
+    <color name="purple_200">#BB86FC</color>
+    <color name="purple_700">#3700B3</color>
+    <color name="teal_200">#03DAC5</color>
+    <!-- Overlays app -->
+    <color name="overlay_pupilas_turquesa">#00BCD4</color>
+    <color name="overlay_armazon_naranja">#FF9800</color>
+    <color name="dnp_overlay_lens">#4CAF50</color>
+
+</resources>

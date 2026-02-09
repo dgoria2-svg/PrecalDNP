@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Estado deshabilitado -->
+    <item android:state_enabled="false">
+        <shape android:shape="rectangle">
+            <corners android:radius="16dp"/>
+            <stroke android:width="2dp" android:color="#33000000"/>
+            <solid android:color="@android:color/transparent"/>
+        </shape>
+    </item>
+
+    <!-- Estado normal con efecto ripple -->
+    <item>
+        <ripple android:color="?attr/colorControlHighlight">
+            <item>
+                <shape android:shape="rectangle">
+                    <corners android:radius="16dp"/>
+                    <stroke android:width="2dp" android:color="?attr/colorPrimary"/>
+                    <solid android:color="@android:color/transparent"/>
+                </shape>
+            </item>
+        </ripple>
+    </item>
+</selector>

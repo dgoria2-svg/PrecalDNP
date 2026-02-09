@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+<!-- Permisos -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+    <!-- Si vas a leer de galería en Android 13+/14+, usá UNO -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <!-- <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" /> -->
+
+    <!-- Cámara no obligatoria para instalar -->
+    <uses-feature
+        android:name="android.hardware.camera.any"
+        android:required="false" />
+
+    <application
+        android:name="com.dg.precaldnp.App"
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:theme="@style/Theme.MedirDNP">
+
+        <!-- Welcome = actividad lanzadora; usa SplashScreen del sistema vía theme -->
+        <activity
+            android:name="com.dg.precaldnp.ui.WelcomeActivity"
+            android:exported="true"
+            android:theme="@style/Theme.MedirDNP.Splash"
+            android:screenOrientation="portrait">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Instrucciones -->
+        <activity
+            android:name="com.dg.precaldnp.ui.InstructionsActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+
+        <!-- Captura integrada: círculo 75 → .FIL -->
+        <activity
+            android:name="com.dg.precaldnp.ui.StillCaptureActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+
+        <!-- Resultado de Precal (muestra/genera .FIL) -->
+
+        <activity
+            android:name="com.dg.precaldnp.ui.ResultsPrecalActivity"
+            android:exported="false"
+            android:label="@string/results_precal_title"
+            android:screenOrientation="portrait" />
+
+
+        <activity
+            android:name="com.dg.precaldnp.ui.DnpFaceCaptureActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+
+        <activity
+            android:name="com.dg.precaldnp.ui.ResultsActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+
+        <!-- FileProvider para compartir/leer archivos internos -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+    </application>
+</manifest>
