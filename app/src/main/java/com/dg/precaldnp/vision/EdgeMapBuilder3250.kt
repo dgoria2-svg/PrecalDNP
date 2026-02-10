@@ -31,12 +31,8 @@ object EdgeMapBuilder3250 {
     enum class EdgeMode3250 { LEGACY, DIVINE }
 
     // ------------------------------------------------------------
-    // Parámetros
+    // Parámetros (FULL)
     // ------------------------------------------------------------
-
-    private const val BAND_MIN_PX = 6f
-    private const val BAND_MAX_PX = 42f
-    private const val BAND_K_T = 1.75f
 
     private const val K_H = 0.60f
     private const val K_V = 0.60f
@@ -53,10 +49,18 @@ object EdgeMapBuilder3250 {
     private const val TAN67_DEN = 100
 
     private const val DIR_MAX_ANGLE_DEG = 25f
+    @Suppress("unused")
     private val DIR_COS_TOL: Float = cos(Math.toRadians(DIR_MAX_ANGLE_DEG.toDouble())).toFloat()
 
     // DEBUG: si el still es gigante, conviene bajar tamaño del PNG debug
     private const val DEBUG_MAX_DIM_PX = 1600
+
+    // ✅ Filtros NO destructivos (evitan “cajas negras”)
+    // 1) TopKill suave: rampa lineal desde y=0 hasta y=topKillY.
+    //    Arriba reduce score, pero NO anula todo.
+    private const val TOPKILL_MIN_WEIGHT = 0.10f  // 10% del score arriba (para que nunca quede negro)
+    // 2) Mask suave: en pixels masked usamos blur (flatten) y además reducimos score.
+    private const val MASK_SCORE_WEIGHT = 0.55f   // 55% del score en zona mask (evita textura sin agujeros)
 
     data class EdgeStats(
         val maxScore: Float,
@@ -83,22 +87,13 @@ object EdgeMapBuilder3250 {
         debugTag: String = "FULL",
         statsOut: ((EdgeStats) -> Unit)? = null,
 
-        // ✅ DEBUG integrado (no “otra llamada”)
+        // ✅ DEBUG integrado
         ctx: Context? = null,
         debugSaveToGallery3250: Boolean = false,
-        debugAlsoSaveGray3250: Boolean = false,
+        debugAlsoSaveGray3250: Boolean = false
     ): ByteArray {
         val w = stillBmp.width
         val h = stillBmp.height
-        val bb = listOfNotNull(iris.browLeftBottomYpx, iris.browRightBottomYpx)
-            .filter { it.isFinite() }
-            .minOrNull()
-
-        val topKillY = if (bb != null) {
-            // anti-ceja: mata solo arriba de browBottom - pad, pero nunca más abajo de 30% de la imagen
-            (bb - 18f).toInt().coerceIn(0, (h * 0.30f).toInt())
-        } else 0
-
         if (w <= 0 || h <= 0) return ByteArray(0)
 
         val gray = ByteArray(w * h)
@@ -183,8 +178,10 @@ object EdgeMapBuilder3250 {
         val B = borderKillPx.coerceIn(0, min(w, h) / 3)
         val yKill = topKillY.coerceIn(0, h)
 
+        // blur para flattening (mask)
         val blurU8 = boxBlur3x3U8(grayU8, w, h)
 
+        // score y dir para NMS
         val score = ShortArray(N)
         val dir = ByteArray(N)
         var maxScore = 0
@@ -192,14 +189,27 @@ object EdgeMapBuilder3250 {
 
         val hasMask = (maskFull != null)
 
-        fun pix(idx: Int): Int {
-            return if (hasMask && (maskFull!![idx].toInt() and 0xFF) != 0) u8(blurU8[idx]) else u8(grayU8[idx])
+        fun isMasked(i: Int): Boolean =
+            hasMask && ((maskFull!![i].toInt() and 0xFF) != 0)
+
+        fun pix(i: Int): Int {
+            // ✅ Flatten: si masked => blur; si no => gray
+            return if (isMasked(i)) u8(blurU8[i]) else u8(grayU8[i])
         }
 
-        // Pass 1
+        fun topWeight(y: Int): Float {
+            // ✅ TopKill suave: arriba de yKill reduce score gradualmente pero nunca 0.
+            if (yKill <= 0) return 1f
+            if (y >= yKill) return 1f
+            val t = y.toFloat() / yKill.toFloat().coerceAtLeast(1f) // 0..1
+            return (TOPKILL_MIN_WEIGHT + (1f - TOPKILL_MIN_WEIGHT) * t).coerceIn(TOPKILL_MIN_WEIGHT, 1f)
+        }
+
+        // Pass 1: Scharr + score + dir + max
         for (y in 1 until (h - 1)) {
-            if (y < yKill) continue
             if (y < B || y >= h - B) continue
+            val tw = topWeight(y)
+
             val off = y * w
             val offUp = (y - 1) * w
             val offDn = (y + 1) * w
@@ -207,7 +217,10 @@ object EdgeMapBuilder3250 {
             for (x in 1 until (w - 1)) {
                 if (x < B || x >= w - B) continue
                 val i = off + x
-                if (hasMask && (maskFull!![i].toInt() and 0xFF) != 0)
+
+                // ✅ NO kill por mask. Solo penalizamos score si masked.
+                val mw = if (isMasked(i)) MASK_SCORE_WEIGHT else 1f
+                val wScore = tw * mw
 
                 val p00 = pix(offUp + (x - 1))
                 val p01 = pix(offUp + x)
@@ -227,8 +240,12 @@ object EdgeMapBuilder3250 {
                 val hs100 = ay * 100 - (K_H * 100f).toInt() * ax
                 val vs100 = ax * 100 - (K_V * 100f).toInt() * ay
                 val s100 = max(0, max(hs100, vs100))
-                val s = (s100 / 100).coerceIn(0, 32767)
+                var s = (s100 / 100).coerceIn(0, 32767)
 
+                if (s == 0) continue
+
+                // ✅ aplicar pesos NO destructivos
+                s = (s.toFloat() * wScore).toInt().coerceIn(0, 32767)
                 if (s == 0) continue
 
                 score[i] = s.toShort()
@@ -240,7 +257,7 @@ object EdgeMapBuilder3250 {
         }
 
         if (validCount < 256 || maxScore <= 0) {
-            Log.w(TAG, "EDGE_FULL[$debugTag] not enough signal valid=$validCount max=$maxScore yKill=$yKill B=$B")
+            Log.w(TAG, "EDGE_FULL[$debugTag] not enough signal valid=$validCount max=$maxScore topKillY=$yKill B=$B hasMask=$hasMask")
             return ByteArray(N)
         }
 
@@ -259,12 +276,11 @@ object EdgeMapBuilder3250 {
         val thrLow = max(EDGE_THR_MIN, (thrHigh * HYST_LOW_FRAC).toInt())
 
         // Pass 3: NMS + weak/strong
-        val classMap = ByteArray(N)
+        val classMap = ByteArray(N) // 0 none, 1 weak, 2 strong
         var candCount = 0
         var strongCount = 0
 
         for (y in 1 until (h - 1)) {
-            if (y < yKill) continue
             if (y < B || y >= h - B) continue
             val off = y * w
             for (x in 1 until (w - 1)) {
@@ -301,6 +317,7 @@ object EdgeMapBuilder3250 {
         var qt = 0
         var nnz = 0
 
+        // seed: strong
         for (i in 0 until N) {
             if (classMap[i].toInt() == 2) {
                 out[i] = 0xFF.toByte()
@@ -319,7 +336,6 @@ object EdgeMapBuilder3250 {
                 val yy = y + dy
                 if (xx <= 0 || xx >= w - 1) continue
                 if (yy <= 0 || yy >= h - 1) continue
-                if (yy < yKill) continue
                 if (xx < B || xx >= w - B) continue
                 if (yy < B || yy >= h - B) continue
                 val j = yy * w + xx
@@ -333,7 +349,12 @@ object EdgeMapBuilder3250 {
         }
 
         val dens = nnz.toFloat() / N.toFloat().coerceAtLeast(1f)
-        Log.d(TAG, "EDGE_FULL[$debugTag] max=$maxScore p95=$p95 thrH=$thrHigh thrL=$thrLow strong=$strongCount cand=$candCount nnz=$nnz/$N dens=${"%.4f".format(dens)} yKill=$yKill B=$B")
+        Log.d(
+            TAG,
+            "EDGE_FULL[$debugTag] max=$maxScore p95=$p95 thrH=$thrHigh thrL=$thrLow " +
+                    "strong=$strongCount cand=$candCount nnz=$nnz/$N dens=${"%.4f".format(dens)} " +
+                    "topKillY=$yKill B=$B hasMask=$hasMask"
+        )
 
         statsOut?.invoke(
             EdgeStats(
@@ -352,7 +373,7 @@ object EdgeMapBuilder3250 {
     }
 
     // ============================================================
-    // DEBUG: guardar U8 (gray o edge) como PNG en Galería
+    // DEBUG: guardar U8 como PNG en Galería
     // ============================================================
 
     private fun saveU8ToGalleryAsPng3250(
@@ -365,7 +386,6 @@ object EdgeMapBuilder3250 {
     ): Uri? {
         if (u8.size != w * h || w <= 0 || h <= 0) return null
 
-        // downscale para debug si es gigante
         val scale = computeDebugScale3250(w, h)
         val outW = (w * scale).toInt().coerceAtLeast(1)
         val outH = (h * scale).toInt().coerceAtLeast(1)
@@ -486,6 +506,9 @@ object EdgeMapBuilder3250 {
         return min(thrBase, thrCap).coerceAtLeast(EDGE_THR_MIN)
     }
 
+    /**
+     * Cuantiza dirección (0,45,90,135) sin atan2 (rápido).
+     */
     private fun quantizeDir3250(gx: Int, gy: Int, ax: Int, ay: Int): Int {
         if (ax == 0 && ay == 0) return 0
         if (ay * TAN22_DEN <= ax * TAN22_NUM) return 0

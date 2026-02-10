@@ -193,8 +193,8 @@ object DnpFacePipeline3250 {
                 ?: EdgeMapBuilder3250.buildFullFrameEdgeMapFromBitmap3250(
                     stillBmp = stillBmp,
                     borderKillPx = 4,
-                    topKillY = 0,
-                    maskFull = null,
+                    topKillY = topKillY3250,
+                    maskFull = maskFull3250,
                     debugTag = "FACE",
                     ctx = ctx,
                     debugSaveToGallery3250 = true
