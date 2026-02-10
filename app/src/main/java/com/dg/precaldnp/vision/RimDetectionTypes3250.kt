@@ -12,28 +12,40 @@ import android.graphics.RectF
 data class RimDetectionResult(
     val ok: Boolean,
     val confidence: Float,
-
     val roiPx: RectF,
-
     val probeYpx: Float,
-
     val topYpx: Float,
     val bottomYpx: Float,
 
+    // ✅ NUEVO: fila donde se midieron L/R (yWalls)
+    val wallsYpx: Float,
+
+    // ✅ NUEVO: seed X usado para center→out
+    val seedXpx: Float,
+
+    // INNER (medidos EN wallsYpx)
     val innerLeftXpx: Float,
     val innerRightXpx: Float,
-
     val nasalInnerXpx: Float,
     val templeInnerXpx: Float,
 
     val heightPx: Float,
     val innerWidthPx: Float,
 
-    // Para debug overlay (opcionales)
-    val topPolylinePx: List<PointF>? = null,
-    val bottomPolylinePx: List<PointF>? = null
-)
+    val topPolylinePx: List<PointF>?,
+    val bottomPolylinePx: List<PointF>?,
 
+    // diag opcional
+    val pxPerMmSeedX: Float? = null,
+
+    // OUTER (future)
+    val outerLeftXpx: Float? = null,
+    val outerRightXpx: Float? = null,
+    val nasalOuterXpx: Float? = null,
+    val templeOuterXpx: Float? = null,
+    val rimThicknessPx: Float? = null,
+    val outerWidthPx: Float? = null
+)
 /**
  * Paquete de salida del detector:
  * - result: lo que usa la Activity para anchors/bridge/debug

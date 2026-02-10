@@ -9,7 +9,6 @@ import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
@@ -22,6 +21,11 @@ import kotlin.math.sqrt
  * Regla de Oro (EDGE->ARCFIT):
  * - edgesGray debe ser un edgeMap binario 0/255 (DIVINE o LEGACY binario).
  * - ArcFit lo trata como booleano (edge/no-edge). No “intensidades inventadas”.
+ *
+ * Regla 3250 (lado):
+ * - OD (ojo derecho) en la FOTO está a la IZQUIERDA de la midline => eyeSideSign=-1
+ * - OI (ojo izquierdo) en la FOTO está a la DERECHA de la midline => eyeSideSign=+1
+ * - nasal siempre apunta hacia la midline => nasalUx = -eyeSideSign
  */
 object FilPlaceFromArc3250 {
 
@@ -36,40 +40,64 @@ object FilPlaceFromArc3250 {
         val usedSamples: Int
     )
 
+    /**
+     * placeFilByArc3250
+     *
+     * Ventanas angulares:
+     * - allowedArcFromDeg/allowedArcToDeg: ventana “oficial” (p.ej. bottom arc) -> si vienen, mandan.
+     * - includeDegFrom/includeDegTo: ventana candidata (legacy / compat) -> se usa SOLO si allowedArc* es null.
+     * - excludeDegFrom/excludeDegTo: fallback para NO muestrear arco superior (si no hay ventana include/allowed).
+     */
     fun placeFilByArc3250(
         filPtsMm: List<PointF>,
         filHboxMm: Double,
         filVboxMm: Double,
+
+        // ✅ COMPAT: si te lo pasan desde afuera, ahora SE USA (si allowedArc* no viene)
+        includeDegFrom: Double? = null,
+        includeDegTo: Double? = null,
 
         edgesGray: ByteArray?,
         w: Int,
         h: Int,
 
         originPxRoi: PointF,
-        midlineXpxRoi: Float,
+
+        // -1 = OD (xEye < midline), +1 = OI (xEye > midline)
+        eyeSideSign3250: Int,
+
         pxPerMmInitGuess: Double,
 
+        // ✅ NUEVO (ROI-local, mismo w*h)
+        maskU8: ByteArray? = null,
+
+        // ✅ ventana “oficial” (wrap OK). Si viene, manda sobre includeDeg*
+        allowedArcFromDeg: Double? = null,
+        allowedArcToDeg: Double? = null,
+
+        // ⚠️ observed NO se usa como veto (porque puede ser arco parcial). Se ignora para reject.
         pxPerMmObserved: Double? = null,
+
         pxPerMmFixed: Double? = null,
         filOverInnerMmPerSide3250: Double,
-        excludeDegFrom: Double = 40.0,
-        excludeDegTo: Double = 140.0,
+
+        // fallback si no hay ventana allowed/include
+        excludeDegFrom: Double = 70.0,
+        excludeDegTo: Double = 120.0,
+
         stepDeg: Double = 2.0,
+
+        // continuidad mínima de hits (para descartar puntos sueltos)
+        minRunHits3250: Int = 4,
+
         iters: Int = 2,
         rSearchRelLo: Double = 0.70,
         rSearchRelHi: Double = 1.35,
 
         bottomAnchorYpxRoi: Float? = null,
 
-        tolScaleRel3250: Double = 0.15,
-        rmsMaxPx3250: Double = 20.0,
-
-        // Con edgeMap binario (0/255): edgeStrengthAtN devuelve 0 o 1
-        thrEdge01: Float = 0.28f,
-
-        wMin: Double = 0.10,
-        rayLambda: Double = 0.85,
-        edgePow: Double = 1.4
+        // guardrails
+        rmsMaxPx3250: Double = 20.0
     ): Fit3250? {
 
         if (filPtsMm.size < 10) {
@@ -99,34 +127,38 @@ object FilPlaceFromArc3250 {
             Log.w(TAG, "edgeMap size mismatch size=${eGray.size} w*h=$total")
             return null
         }
+        val mU8 = maskU8?.takeIf { it.size == total }
 
-        // =========================
-        // EdgeMap sanity + densidad
-        // =========================
         run {
             var nnz = 0
             var mx = 0
             var nonBinary = 0
+            var masked = 0
 
             for (i in 0 until total) {
+                val isM = (mU8 != null && ((mU8[i].toInt() and 0xFF) != 0))
+                if (isM) { masked++; continue }
+
                 val v = (eGray[i].toInt() and 0xFF)
                 if (v != 0) nnz++
                 if (v > mx) mx = v
                 if (v != 0 && v != 255) nonBinary++
             }
 
-            val frac = nnz.toDouble() / total.toDouble()
-            Log.d(
-                TAG,
-                "edgeMap density: nnz=$nnz/$total frac=${"%.5f".format(frac)} max=$mx nonBinary=$nonBinary thrEdge01=$thrEdge01"
-            )
+            val eff = (total - masked).coerceAtLeast(1)
+            val frac = nnz.toDouble() / eff.toDouble()
+            Log.d(TAG, "edgeMap density (eff): nnz=$nnz/$eff frac=${"%.5f".format(frac)} max=$mx nonBinary=$nonBinary masked=$masked")
 
             if (frac < 0.00015) {
-                Log.w(TAG, "edgeMap demasiado ralo: frac=${"%.5f".format(frac)} (min=0.00015)")
+                Log.w(TAG, "edgeMap demasiado ralo (eff): frac=${"%.5f".format(frac)} (min=0.00015)")
                 return null
             }
         }
+        // =========================
+        // EdgeMap sanity + densidad
+        // =========================
 
+        // Modelo inner centrado (tu lógica actual)
         val polyMm = buildCenteredInnerPolyMm(
             filPtsMm = filPtsMm,
             filHboxMm = filHboxMm,
@@ -138,37 +170,56 @@ object FilPlaceFromArc3250 {
             return null
         }
 
-        // Lock duro SOLO para fixed. observed = constraint blanda.
+        // Lock duro SOLO para fixed.
         val pxFixed = pxPerMmFixed?.takeIf { it.isFinite() && it > 1e-6 }?.coerceIn(2.5, 20.0)
-        val pxObs = pxPerMmObserved?.takeIf { it.isFinite() && it > 1e-6 }?.coerceIn(2.5, 20.0)
 
-        if (pxObs != null) {
-            val rel = abs(pxPerMmInitGuess - pxObs) / pxObs
-            if (rel > max(0.25, tolScaleRel3250 * 2.0)) {
-                Log.w(TAG, "ARC-FIT: initGuess lejos de observed. guess=${fmt2(pxPerMmInitGuess)} obs=${fmt2(pxObs)} rel=${fmt2(rel)}")
-            }
-        }
-        if (pxFixed != null) {
-            val rel = abs(pxPerMmInitGuess - pxFixed) / pxFixed
-            if (rel > max(0.25, tolScaleRel3250 * 2.0)) {
-                Log.w(TAG, "ARC-FIT: initGuess lejos de fixed. guess=${fmt2(pxPerMmInitGuess)} fixed=${fmt2(pxFixed)} rel=${fmt2(rel)}")
+        // observed: solo debug, NO veto
+        val pxObsDbg = pxPerMmObserved?.takeIf { it.isFinite() && it > 1e-6 }?.coerceIn(2.5, 20.0)
+        if (pxObsDbg != null) {
+            val rel = abs(pxPerMmInitGuess - pxObsDbg) / pxObsDbg
+            if (rel > 0.35) {
+                Log.w(TAG, "ARC-FIT: initGuess lejos de observed (DBG). guess=${fmt2(pxPerMmInitGuess)} obs=${fmt2(pxObsDbg)} rel=${fmt2(rel)} (no veto)")
             }
         }
 
-        // nasalUxFixed: si midline está a la derecha del centro ROI, este ROI es ojo izquierdo (nasal hacia +X)
-        // si midline está a la izquierda del centro ROI, este ROI es ojo derecho (nasal hacia -X)
-        val nasalUxFixed = if (midlineXpxRoi >= (w * 0.5f)) +1.0 else -1.0
+        // nasal siempre apunta a la midline => nasalUx = -eyeSideSign
+        val eyeSide = when {
+            eyeSideSign3250 < 0 -> -1
+            eyeSideSign3250 > 0 -> +1
+            else -> +1
+        }
+        val nasalUxFixed = (-eyeSide).toDouble()
+
+        // ------------------------------------------------------------
+        // Ventana angular efectiva (precedencia):
+        // allowedArc* > includeDeg* > null (fallback exclude)
+        // ------------------------------------------------------------
+        val winFromDeg = allowedArcFromDeg ?: includeDegFrom
+        val winToDeg = allowedArcToDeg ?: includeDegTo
+        val hasWin = (winFromDeg != null && winToDeg != null)
+        val winLenDeg = if (hasWin) arcLenDeg3250(winFromDeg, winToDeg) else 360.0
 
         fun allowed(deg: Double): Boolean {
-            val a = ((deg % 360.0) + 360.0) % 360.0
-            return a !in excludeDegFrom..excludeDegTo
+            val a = normDeg3250(deg)
+
+            // ✅ si tengo ventana (allowed/include): SOLO muestreo ahí
+            if (hasWin) return containsOnArc3250(a, winFromDeg, winToDeg)
+
+            // fallback: excluye arco superior (wrap OK)
+            val f = normDeg3250(excludeDegFrom)
+            val t = normDeg3250(excludeDegTo)
+            val exclLen = arcLenDeg3250(f, t)
+            if (exclLen <= 1e-6) return true
+            return !containsOnArc3250(a, f, t)
         }
 
         /**
-         * Edge strength en vecindad 3x3, pero con edgeMap BINARIO:
+         * Edge strength en vecindad 3x3, con edgeMap BINARIO:
          * - devuelve 1f si hay algún edge !=0 cerca
          * - si no, 0f
+         *
          */
+
         fun edgeStrengthAtN(ix: Int, iy: Int): Float {
             if (ix !in 0 until w || iy !in 0 until h) return 0f
             for (dy in -1..1) {
@@ -178,7 +229,10 @@ object FilPlaceFromArc3250 {
                 for (dx in -1..1) {
                     val x = ix + dx
                     if (x !in 0 until w) continue
-                    val v = (eGray[row + x].toInt() and 0xFF)
+                    val idx = row + x
+
+                    if (mU8 != null && ((mU8[idx].toInt() and 0xFF) != 0)) continue // ✅ veto
+                    val v = (eGray[idx].toInt() and 0xFF)
                     if (v != 0) return 1f
                 }
             }
@@ -192,8 +246,7 @@ object FilPlaceFromArc3250 {
             var bestT = Double.POSITIVE_INFINITY
             var best: PointF? = null
 
-            fun cross(ax: Double, ay: Double, bx: Double, by: Double) =
-                ax * by - ay * bx
+            fun cross(ax: Double, ay: Double, bx: Double, by: Double) = ax * by - ay * bx
 
             for (i in 0 until n) {
                 val a = polyMm[i]
@@ -242,18 +295,27 @@ object FilPlaceFromArc3250 {
                 val ix = x.roundToInt()
                 val iy = y.roundToInt()
 
+                // (opcional pero recomendado) bounds rápido
+                if (ix !in 0 until w || iy !in 0 until h) {
+                    t += 1.0
+                    continue
+                }
+
+                // ✅ ACÁ va tu snippet (veto por máscara en el punto central)
+                val idx0 = iy * w + ix
+                if (mU8 != null && ((mU8[idx0].toInt() and 0xFF) != 0)) {
+                    t += 1.0
+                    continue
+                }
+
+
                 val ed = edgeStrengthAtN(ix, iy)
-                if (ed >= thrEdge01) {
+                if (ed > 0f) {
                     val d = abs(t - rPredPx)
-
-                    // Con edgeMap binario: ed es 0/1 => edW es 0/1 (edgePow queda por compat).
-                    val edW = ed.toDouble().pow(edgePow).coerceIn(0.0, 1.0)
-
-                    val score = d - rayLambda * edW
-                    if (score < bestScore) {
-                        bestScore = score
+                    if (d < bestScore) {
+                        bestScore = d
                         bestHit = RayHit(PointF(x.toFloat(), y.toFloat()), ed)
-                        if (d <= 0.3 && ed >= 0.85f) break
+                        if (d <= 0.3) break
                     }
                 }
                 t += 1.0
@@ -277,7 +339,6 @@ object FilPlaceFromArc3250 {
             val dyWanted = (yAnchor - bottomActual)
             if (abs(dyWanted) < 0.25f) return origin
 
-            // clamp global (no deformar por clamping punto-a-punto)
             val dyMin = -minY
             val dyMax = (h - 1f) - maxY
             val dy = dyWanted.coerceIn(dyMin, dyMax)
@@ -312,19 +373,31 @@ object FilPlaceFromArc3250 {
             origin: PointF,
             pxPerMmGuess: Double,
             thetaGuessRad: Double,
-            pxPerMmFixedLocal: Double?,
-            pxPerMmObservedLocal: Double?
+            pxPerMmFixedLocal: Double?
         ): FitInternal? {
-
-            val pairs = ArrayList<PairPQ>(256)
 
             val cG = cos(thetaGuessRad)
             val sG = sin(thetaGuessRad)
 
+            data class TmpHit(val idx: Int, val pMm: PointF, val qRelUp: PointF)
+
+            val hits = ArrayList<TmpHit>(256)
+
+            // mínimos dinámicos si hay ventana
+            val st = stepDeg.takeIf { it.isFinite() && it > 1e-6 } ?: 2.0
+            val allowedSteps = if (hasWin) (kotlin.math.ceil(winLenDeg / st).toInt() + 1).coerceAtLeast(1) else Int.MAX_VALUE
+
+            val minHitsRequired = if (hasWin) max(16, (0.55 * allowedSteps.toDouble()).roundToInt()) else 50
+            val minPairsRequired = if (hasWin) max(16, (0.55 * allowedSteps.toDouble()).roundToInt()) else 50
+
+            // sampleo angular
+            var idx = 0
             var deg = 0.0
             while (deg < 360.0) {
+
                 if (!allowed(deg)) {
-                    deg += stepDeg
+                    idx++
+                    deg += st
                     continue
                 }
 
@@ -334,26 +407,25 @@ object FilPlaceFromArc3250 {
 
                 // Dirección en "modelo Up" (mm)
                 val dirUpModelX = c * nasalUxFixed
-                val dirUpModelY = s
 
-                val pMm = intersectRayPolyMm(dirUpModelX, dirUpModelY)
+                val pMm = intersectRayPolyMm(dirUpModelX, s)
                 if (pMm == null) {
-                    deg += stepDeg
+                    idx++
+                    deg += st
                     continue
                 }
 
                 val rMm = hypot(pMm.x.toDouble(), pMm.y.toDouble())
                 val rPredPx = rMm * pxPerMmGuess
 
-                // raycast en imagen usando thetaGuess (corrige correspondencias con rotación real)
-                val dirUpImgX = cG * dirUpModelX - sG * dirUpModelY
-                val dirUpImgY = sG * dirUpModelX + cG * dirUpModelY
-                val dirDownX = dirUpImgX
+                // raycast en imagen usando thetaGuess
+                val dirUpImgX = cG * dirUpModelX - sG * s
+                val dirUpImgY = sG * dirUpModelX + cG * s
                 val dirDownY = -dirUpImgY
 
                 val hit = raycastEdgeBestNearPredictedRadius(
                     origin = origin,
-                    dirDownX = dirDownX,
+                    dirDownX = dirUpImgX,
                     dirDownY = dirDownY,
                     rPredPx = rPredPx
                 )
@@ -364,18 +436,82 @@ object FilPlaceFromArc3250 {
                         (qPx.x - origin.x),
                         -(qPx.y - origin.y)
                     )
-
-                    val edW = hit.edge.toDouble().pow(edgePow).coerceIn(0.0, 1.0)
-                    val wPair = (wMin + (1.0 - wMin) * edW).coerceIn(0.05, 1.0)
-
-                    pairs.add(PairPQ(pMm, qRelUp, wPair))
+                    hits.add(TmpHit(idx, pMm, qRelUp))
                 }
 
-                deg += stepDeg
+                idx++
+                deg += st
             }
 
-            if (pairs.size < 50) {
-                Log.w(TAG, "Arc-fit: insuficientes pairs=${pairs.size} (min=50)")
+            if (hits.size < minHitsRequired) {
+                Log.w(
+                    TAG,
+                    "Arc-fit: insuficientes hits=${hits.size} (min=$minHitsRequired) hasWin=$hasWin winLenDeg=${fmt2(winLenDeg)} stepDeg=${fmt2(st)}"
+                )
+                return null
+            }
+
+            // ========= Continuidad angular (runs) =========
+            val nSteps = idx.coerceAtLeast(1)
+            val hitPresent = BooleanArray(nSteps)
+            for (h0 in hits) {
+                if (h0.idx in 0 until nSteps) hitPresent[h0.idx] = true
+            }
+
+            fun markKeepRuns(minRun: Int): BooleanArray {
+                val keep = BooleanArray(nSteps)
+                if (minRun <= 1) {
+                    for (i in 0 until nSteps) keep[i] = hitPresent[i]
+                    return keep
+                }
+
+                data class Seg(val s: Int, val e: Int) // inclusive
+                val segs = ArrayList<Seg>()
+
+                var i = 0
+                while (i < nSteps) {
+                    if (!hitPresent[i]) { i++; continue }
+                    val s0 = i
+                    while (i < nSteps && hitPresent[i]) i++
+                    val e0 = i - 1
+                    segs.add(Seg(s0, e0))
+                }
+
+                if (segs.isEmpty()) return keep
+
+                // merge wrap
+                val first = segs.first()
+                val last = segs.last()
+                if (segs.size >= 2 && first.s == 0 && last.e == nSteps - 1) {
+                    val mergedLen = (last.e - last.s + 1) + (first.e - 0 + 1)
+                    if (mergedLen >= minRun) {
+                        for (k in last.s..last.e) keep[k] = true
+                        for (k in 0..first.e) keep[k] = true
+                    }
+                    for (seg in segs.drop(1).dropLast(1)) {
+                        val len = seg.e - seg.s + 1
+                        if (len >= minRun) for (k in seg.s..seg.e) keep[k] = true
+                    }
+                    return keep
+                }
+
+                for (seg in segs) {
+                    val len = seg.e - seg.s + 1
+                    if (len >= minRun) for (k in seg.s..seg.e) keep[k] = true
+                }
+                return keep
+            }
+
+            val keepIdx = markKeepRuns(minRunHits3250.coerceAtLeast(1))
+            val pairs = ArrayList<PairPQ>(hits.size)
+            for (hh in hits) {
+                if (hh.idx in 0 until nSteps && keepIdx[hh.idx]) {
+                    pairs.add(PairPQ(hh.pMm, hh.qRelUp, 1.0))
+                }
+            }
+
+            if (pairs.size < minPairsRequired) {
+                Log.w(TAG, "Arc-fit: pairs post-continuidad=${pairs.size} (min=$minPairsRequired) minRunHits=$minRunHits3250 hasWin=$hasWin winLenDeg=${fmt2(winLenDeg)}")
                 return null
             }
 
@@ -389,22 +525,19 @@ object FilPlaceFromArc3250 {
 
             var A = 0.0
             var B = 0.0
-
             for (pp in pairs) {
                 val wgt = pp.weight
-
                 val px = pp.pMm.x.toDouble() - meanPx
                 val py = pp.pMm.y.toDouble() - meanPy
                 val qx = pp.qRelUp.x.toDouble() - meanQx
                 val qy = pp.qRelUp.y.toDouble() - meanQy
-
                 A += wgt * (px * qx + py * qy)
                 B += wgt * (px * qy - py * qx)
             }
 
             val theta = atan2(B, A)
             val ct = cos(theta)
-            val st = sin(theta)
+            val st2 = sin(theta)
 
             val rotDegAbs = abs(Math.toDegrees(theta))
             if (rotDegAbs > 25.0) {
@@ -412,7 +545,6 @@ object FilPlaceFromArc3250 {
                 return null
             }
 
-            // Lock duro SOLO fixed
             val pxFixedLocalClamped = pxPerMmFixedLocal?.takeIf { it.isFinite() && it > 1e-6 }?.coerceIn(2.5, 20.0)
 
             val sScale = if (pxFixedLocalClamped != null) {
@@ -420,31 +552,27 @@ object FilPlaceFromArc3250 {
             } else {
                 var denom = 0.0
                 var numer = 0.0
-
                 for (pp in pairs) {
                     val wgt = pp.weight
-
                     val px = pp.pMm.x.toDouble() - meanPx
                     val py = pp.pMm.y.toDouble() - meanPy
 
-                    val rx = ct * px - st * py
-                    val ry = st * px + ct * py
+                    val rx = ct * px - st2 * py
+                    val ry = st2 * px + ct * py
                     denom += wgt * (rx * rx + ry * ry)
 
                     val qx = pp.qRelUp.x.toDouble() - meanQx
                     val qy = pp.qRelUp.y.toDouble() - meanQy
                     numer += wgt * (qx * rx + qy * ry)
                 }
-
                 if (denom <= 1e-12) return null
-
                 val sFree = numer / denom
                 if (!sFree.isFinite() || sFree <= 1e-9) return null
                 sFree
             }
 
-            val txRel = meanQx - sScale * (ct * meanPx - st * meanPy)
-            val tyRel = meanQy - sScale * (st * meanPx + ct * meanPy)
+            val txRel = meanQx - sScale * (ct * meanPx - st2 * meanPy)
+            val tyRel = meanQy - sScale * (st2 * meanPx + ct * meanPy)
 
             var newOrigin = PointF(
                 (origin.x + txRel).toFloat(),
@@ -457,22 +585,17 @@ object FilPlaceFromArc3250 {
                 val px = pp.pMm.x.toDouble()
                 val py = pp.pMm.y.toDouble()
 
-                val predX = sScale * (ct * px - st * py) + txRel
-                val predY = sScale * (st * px + ct * py) + tyRel
+                val predX = sScale * (ct * px - st2 * py) + txRel
+                val predY = sScale * (st2 * px + ct * py) + tyRel
 
                 val dx = predX - pp.qRelUp.x.toDouble()
                 val dy = predY - pp.qRelUp.y.toDouble()
-
                 err += wgt * (dx * dx + dy * dy)
             }
             val rms = sqrt(err / sumW)
-
-            // Validación RMS estricta si hay fixed
-            if (pxFixedLocalClamped != null) {
-                if (!rms.isFinite() || rms > rmsMaxPx3250) {
-                    Log.w(TAG, "ARC-FIT FAIL: fixedScale rms=${fmt2(rms)} max=${fmt2(rmsMaxPx3250)} fixedPxMm=${fmt2(pxFixedLocalClamped)} used=${pairs.size}")
-                    return null
-                }
+            if (!rms.isFinite() || rms > rmsMaxPx3250) {
+                Log.w(TAG, "ARC-FIT FAIL: rms=${fmt2(rms)} max=${fmt2(rmsMaxPx3250)} used=${pairs.size}")
+                return null
             }
 
             val placed = ArrayList<PointF>(polyMm.size)
@@ -480,8 +603,8 @@ object FilPlaceFromArc3250 {
                 val px = p.x.toDouble()
                 val py = p.y.toDouble()
 
-                val xRelUp = sScale * (ct * px - st * py) + txRel
-                val yRelUp = sScale * (st * px + ct * py) + tyRel
+                val xRelUp = sScale * (ct * px - st2 * py) + txRel
+                val yRelUp = sScale * (st2 * px + ct * py) + tyRel
 
                 placed.add(
                     PointF(
@@ -493,39 +616,17 @@ object FilPlaceFromArc3250 {
 
             newOrigin = applyBottomAnchorIfAny(placed, newOrigin)
 
-            val allInBounds = placed.all { p ->
-                p.x in 0f..(w - 1f) && p.y in 0f..(h - 1f)
-            }
+            val allInBounds = placed.all { p -> p.x in 0f..(w - 1f) && p.y in 0f..(h - 1f) }
             if (!allInBounds) {
-                val outCount = placed.count { p ->
-                    p.x !in 0f..(w - 1f) || p.y !in 0f..(h - 1f)
-                }
+                val outCount = placed.count { p -> p.x !in 0f..(w - 1f) || p.y !in 0f..(h - 1f) }
                 Log.w(TAG, "Arc-fit: placed fuera del ROI. outCount=$outCount/${placed.size} w=$w h=$h")
                 return null
             }
 
-            // Constraint blanda contra observed (si existe)
-            if (pxPerMmObservedLocal != null && pxPerMmObservedLocal.isFinite() && pxPerMmObservedLocal > 1e-6) {
-                val obs = pxPerMmObservedLocal.coerceIn(2.5, 20.0)
-                val rel = abs(sScale - obs) / obs
-                val okScale = rel <= tolScaleRel3250
-                val okRms = rms.isFinite() && rms <= rmsMaxPx3250
-
-                Log.d(
-                    TAG,
-                    "GUANTE obs=${"%.3f".format(obs)} scale=${"%.3f".format(sScale)} " +
-                            "rel=${"%.3f".format(rel)} rms=${"%.1f".format(rms)} " +
-                            "okScale=$okScale okRms=$okRms used=${pairs.size} rotDeg=${"%.1f".format(Math.toDegrees(theta))} thetaGuessDeg=${"%.1f".format(Math.toDegrees(thetaGuessRad))}"
-                )
-
-                if (!okScale) {
-                    Log.w(TAG, "Arc-fit REJECT: escala vs observed fuera de tol. rel=${fmt2(rel)} > tol=${fmt2(tolScaleRel3250)}")
-                    return null
-                }
-                if (!okRms) {
-                    Log.w(TAG, "Arc-fit REJECT: RMS muy alto. rms=${fmt2(rms)} > max=${fmt2(rmsMaxPx3250)}")
-                    return null
-                }
+            // debug (sin veto por observed)
+            if (pxObsDbg != null) {
+                val rel = abs(sScale - pxObsDbg) / pxObsDbg
+                Log.d(TAG, "GUANTE(DBG) obs=${"%.3f".format(pxObsDbg)} scale=${"%.3f".format(sScale)} rel=${"%.3f".format(rel)} rms=${"%.1f".format(rms)} used=${pairs.size} rotDeg=${"%.1f".format(Math.toDegrees(theta))}")
             }
 
             return FitInternal(
@@ -543,7 +644,6 @@ object FilPlaceFromArc3250 {
         var thetaGuessRad = 0.0
 
         var last: FitInternal? = null
-
         val lockFixed = (pxFixed != null)
 
         repeat(iters.coerceIn(1, 3)) { iterNum ->
@@ -551,31 +651,23 @@ object FilPlaceFromArc3250 {
                 origin = origin,
                 pxPerMmGuess = guess,
                 thetaGuessRad = thetaGuessRad,
-                pxPerMmFixedLocal = pxFixed,
-                pxPerMmObservedLocal = pxObs
+                pxPerMmFixedLocal = pxFixed
             ) ?: return last?.toPublic()
 
-            Log.d(
-                TAG,
-                "Arc-fit iter=$iterNum pairs=${fit.used} scale=${fmt2(fit.pxPerMm)} " +
-                        "rot=${fmt2(fit.rotDeg)}° rms=${fmt2(fit.rmsPx)} " +
-                        "origin=(${fmt2(fit.originUpdated.x.toDouble())},${fmt2(fit.originUpdated.y.toDouble())})"
-            )
+            Log.d(TAG, "Arc-fit iter=$iterNum pairs=${fit.used} scale=${fmt2(fit.pxPerMm)} rot=${fmt2(fit.rotDeg)}° rms=${fmt2(fit.rmsPx)} origin=(${fmt2(fit.originUpdated.x.toDouble())},${fmt2(fit.originUpdated.y.toDouble())})")
 
             last = fit
             origin = fit.originUpdated
             thetaGuessRad = Math.toRadians(fit.rotDeg)
-
-            guess = if (!lockFixed) {
-                fit.pxPerMm
-            } else {
-                pxFixed
-            }
+            guess = if (!lockFixed) fit.pxPerMm else pxFixed
         }
 
         return last?.toPublic()
     }
 
+    // ------------------------------------------------------------
+    // Modelo inner centrado (tu lógica)
+    // ------------------------------------------------------------
     private fun buildCenteredInnerPolyMm(
         filPtsMm: List<PointF>,
         filHboxMm: Double,
@@ -601,7 +693,6 @@ object FilPlaceFromArc3250 {
         val cx = (minX + maxX) * 0.5
         val cy = (minY + maxY) * 0.5
 
-        // Shrink X/Y separado usando HBOX/VBOX (evita deformación)
         val innerW = (filHboxMm - 2.0 * filOverInnerMmPerSide).coerceAtLeast(filHboxMm * 0.80)
         val innerH = (filVboxMm - 2.0 * filOverInnerMmPerSide).coerceAtLeast(filVboxMm * 0.80)
 
@@ -618,5 +709,26 @@ object FilPlaceFromArc3250 {
             )
         }
         return poly
+    }
+
+    // ------------------------------------------------------------
+    // Helpers angulares UNICOS (sin duplicación)
+    // ------------------------------------------------------------
+    private fun normDeg3250(d: Double): Double {
+        val a = d % 360.0
+        return if (a < 0) a + 360.0 else a
+    }
+
+    private fun containsOnArc3250(targetDeg: Double, fromDeg: Double, toDeg: Double): Boolean {
+        val t = normDeg3250(targetDeg)
+        val a = normDeg3250(fromDeg)
+        val b = normDeg3250(toDeg)
+        return if (a <= b) (t in a..b) else (t >= a || t <= b) // wrap
+    }
+
+    private fun arcLenDeg3250(fromDeg: Double, toDeg: Double): Double {
+        val a = normDeg3250(fromDeg)
+        val b = normDeg3250(toDeg)
+        return (b - a + 360.0) % 360.0
     }
 }

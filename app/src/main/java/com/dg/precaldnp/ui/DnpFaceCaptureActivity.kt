@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
 import android.util.Rational
 import android.view.Surface
@@ -50,9 +51,9 @@ class DnpFaceCaptureActivity : ComponentActivity() {
         const val EXTRA_ORDER_ID = "extra_order_id"
         const val EXTRA_SHAPE_TRACE = "extra_shape_trace"
 
-        private const val FIL_INNER_REDUCTION_TOTAL_MM_3250 = 2.0
+        private const val FIL_INNER_REDUCTION_TOTAL_MM_3250 = 1
         private const val FIL_OVER_INNER_MM_PER_SIDE_3250 =
-            FIL_INNER_REDUCTION_TOTAL_MM_3250 / 2.0 // = 1.0
+            FIL_INNER_REDUCTION_TOTAL_MM_3250 / 2.0 // = 0.5 mm por lado
 
         const val EXTRA_CLEANUP_ON_EXIT_3250 = "extra_cleanup_on_exit_3250"
     }
@@ -89,7 +90,9 @@ class DnpFaceCaptureActivity : ComponentActivity() {
     private var irisEngine3250: IrisDnpLandmarker3250? = null
 
     // --- Runtime
+    @Volatile
     private var lastShotHint3250: DnpShotHint3250? = null
+
     private var frames3250 = 0
 
     @Volatile
@@ -125,6 +128,7 @@ class DnpFaceCaptureActivity : ComponentActivity() {
         layoutProcessing = findViewById(R.id.layoutProcessing)
 
         previewView.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+
         layoutProcessing.bringToFront()
         showProcessing(false)
 
@@ -238,12 +242,6 @@ class DnpFaceCaptureActivity : ComponentActivity() {
                     .build()
                     .also { it.surfaceProvider = previewView.surfaceProvider }
 
-                /**
-                 * ✅ CAPTURE “PNG real”:
-                 * - Forzamos buffer YUV en memoria (sin JPEG intermedio).
-                 * - El PNG final lo genera DnpBurstOrchestrator3250 (Bitmap.compress PNG).
-                 * - MINIMIZE_LATENCY para poder meter 10 frames en ~1s.
-                 */
                 val ic = ImageCapture.Builder()
                     .setResolutionSelector(resolutionSelector)
                     .setTargetRotation(rotation)
@@ -257,36 +255,24 @@ class DnpFaceCaptureActivity : ComponentActivity() {
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build()
 
-                ia.setAnalyzer(analysisExecutor) { image ->
-                    try {
-                        frames3250++
-                        val vw = previewView.width
-                        val vh = previewView.height
+                // throttle UI invalidation (sin runOnUiThread por frame)
+                var lastHintUiTs3250 = 0L
 
-                        if (vw > 0 && vh > 0) {
-                            val hint = DnpFacePipeline3250.buildBaselineShotHint3250(
-                                viewW = vw,
-                                viewH = vh,
+                ia.setAnalyzer(analysisExecutor) { image ->
+                    image.use { image ->
+                        val now = SystemClock.uptimeMillis()
+                        if (now - lastHintUiTs3250 >= 100L) {
+                            lastHintUiTs3250 = now
+
+                            lastShotHint3250 = DnpFacePipeline3250.buildBaselineShotHint3250(
+                                viewW = previewView.width,
+                                viewH = previewView.height,
                                 rotationDeg = image.imageInfo.rotationDegrees,
                                 filHboxMm = filHboxMm3250,
                                 filVboxMm = filVboxMm3250
                             )
-                            runOnUiThread {
-                                lastShotHint3250 = hint
-                                overlay.invalidate()
-                            }
+                            overlay.postInvalidateOnAnimation()
                         }
-
-                        if (frames3250 % 30 == 0) {
-                            Log.d(
-                                TAG,
-                                "analyzer alive: frame=$frames3250 vw=${previewView.width} vh=${previewView.height} hint=${lastShotHint3250 != null}"
-                            )
-                        }
-                    } catch (t: Throwable) {
-                        Log.e(TAG, "analyzer error", t)
-                    } finally {
-                        image.close()
                     }
                 }
 
@@ -311,6 +297,11 @@ class DnpFaceCaptureActivity : ComponentActivity() {
 
                 try { camera?.cameraControl?.setZoomRatio(1.0f) } catch (_: Throwable) {}
 
+                // orden de Z por las dudas post-bind
+                overlay.bringToFront()
+                layoutProcessing.bringToFront()
+                showProcessing(false)
+
             }, ContextCompat.getMainExecutor(this))
         }
     }
@@ -318,7 +309,6 @@ class DnpFaceCaptureActivity : ComponentActivity() {
     // ============================================================
     // Burst + Measure
     // ============================================================
-
     private fun startBurstAndMeasure3250() {
         val ic = imageCapture ?: return
         if (busyCapture3250) return
@@ -366,6 +356,7 @@ class DnpFaceCaptureActivity : ComponentActivity() {
                     savedUri = u,
                     st = shapeTrace3250,
                     sp = snapFixed,
+                    orderId3250 = orderId3250,
                     filHboxMm = filHboxMm3250,
                     filVboxMm = filVboxMm3250,
                     filOdMm = filOdMm3250,
@@ -376,7 +367,6 @@ class DnpFaceCaptureActivity : ComponentActivity() {
                     saveRingRoiDebug = false,
                     stage = DnpFacePipeline3250.StageCb3250 { resId ->
                         runOnUiThread {
-                            // si querés mantener el orderId arriba, concatená en vez de pisar
                             tvInfo.text = getString(resId)
                         }
                     }
@@ -393,33 +383,45 @@ class DnpFaceCaptureActivity : ComponentActivity() {
             }
 
         ) { res ->
-            busyCapture3250 = false
-            btnCapture.isEnabled = true
-            showProcessing(false)
+            runOnUiThread {
+                busyCapture3250 = false
+                btnCapture.isEnabled = true
+                showProcessing(false)
 
-            val out = res.bestOut
-            if (out == null) {
-                Toast.makeText(this, getString(R.string.dnp_measure_failed), Toast.LENGTH_LONG).show()
-                return@run3250
+                val out = res.bestOut
+                if (out == null) {
+                    Toast.makeText(this, getString(R.string.dnp_measure_failed), Toast.LENGTH_LONG).show()
+                    return@runOnUiThread
+                }
+                val ancho = (shapeTrace3250.bboxWidthMm ?: Float.NaN).toDouble()
+                val alto  = (shapeTrace3250.bboxHeightMm ?: Float.NaN).toDouble()
+                val diag  = kotlin.math.hypot(ancho, alto)
+
+                val result = DnpFacePipeline3250.metricsToMeasurementResult3250(
+                    m = out.metrics,
+                    originalUriStr = out.originalUriStr,
+                    dbgUriStr = out.dbgPath3250,
+                    finalAnnotatedUriStr = out.finalAnnotatedUriStr3250,  // ✅ ESTA ES LA CLAVE
+                    anchoMm = ancho,
+                    altoMm = alto,
+                    diagMayorMm = diag,
+                    filHboxMm = filHboxMm3250,
+                    filVboxMm = filVboxMm3250
+                )
+                val intent = Intent(this, ResultsActivity::class.java).apply {
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    putExtra(ResultsActivity.KEY_RESULT, result)
+                    putExtra(ResultsActivity.KEY_IMAGE_URI, out.originalUriStr)
+                    putExtra(ResultsActivity.EXTRA_DEBUG_URI_3250, out.dbgPath3250)
+                    putStringArrayListExtra(
+                        EXTRA_CLEANUP_ON_EXIT_3250,
+                        ArrayList(res.cleanupOnExit)
+                    )
+                }
+
+                startActivity(intent)
+                finish()
             }
-
-            val result = DnpFacePipeline3250.metricsToMeasurementResult3250(
-                m = out.metrics,
-                originalUriStr = out.originalUriStr,
-                dbgUriStr = out.dbgPath3250
-            )
-
-            val intent = Intent(this, ResultsActivity::class.java).apply {
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-
-                putExtra(ResultsActivity.KEY_RESULT, result)
-                putExtra(ResultsActivity.KEY_IMAGE_URI, out.originalUriStr)
-                putExtra(ResultsActivity.EXTRA_DEBUG_URI_3250, out.dbgPath3250)
-                putStringArrayListExtra(EXTRA_CLEANUP_ON_EXIT_3250, ArrayList(res.cleanupOnExit))
-            }
-
-            startActivity(intent)
-            finish()
         }
     }
 

@@ -14,6 +14,10 @@ import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
 import java.io.Closeable
 import kotlin.math.abs
 
+
+// ------------------------------
+// Result
+// ------------------------------
 data class DnpMeasurementResult3250(
     val leftIrisCenterPx: PointF,
     val rightIrisCenterPx: PointF,
@@ -34,7 +38,12 @@ data class DnpMeasurementResult3250(
     // borde inferior de la ceja (px, coords imagen)
     val leftBrowBottomYpx: Float? = null,
     val rightBrowBottomYpx: Float? = null,
-    val maskPolysGlobal3250: List<List<PointF>>? = null
+
+    // polys (hulls) globales legacy/debug
+    val maskPolysGlobal3250: List<List<PointF>>? = null,
+
+    // ✅ ojos como elipses (global px) para kill/flatten pre-edge
+    val eyeEllipsesGlobal3250: List<EyeEllipseMask3250>? = null
 )
 
 class IrisDnpLandmarker3250(
@@ -74,6 +83,14 @@ class IrisDnpLandmarker3250(
             for (arr in arrays) for (v in arr) if (v > m) m = v
             return m
         }
+
+        // ✅ índice máximo requerido para TODO lo que usamos (incluye ojos)
+        private val MAX_IDX_NEEDED = maxIdx(
+            LEFT_IRIS, RIGHT_IRIS,
+            LEFT_EYE, RIGHT_EYE,
+            LEFT_BROW, RIGHT_BROW,
+            intArrayOf(IDX_NOSE_TIP, IDX_UPPER_LIP, IDX_LOWER_LIP, IDX_NOSE_BRIDGE, IDX_CHIN)
+        )
     }
 
     private val landmarker: FaceLandmarker
@@ -114,9 +131,8 @@ class IrisDnpLandmarker3250(
 
         val landmarks = faces[0]
 
-        val maxIdxNeeded = maxIdx(RIGHT_IRIS, LEFT_BROW, RIGHT_BROW, intArrayOf(IDX_LOWER_LIP))
-        if (landmarks.size <= maxIdxNeeded) {
-            Log.w(TAG, "Muy pocos landmarks (${landmarks.size})")
+        if (landmarks.size <= MAX_IDX_NEEDED) {
+            Log.w(TAG, "Muy pocos landmarks (${landmarks.size}) need>${MAX_IDX_NEEDED}")
             return null
         }
 
@@ -137,8 +153,8 @@ class IrisDnpLandmarker3250(
             rightIrisPx = t
         }
 
-        val dx = rightIrisPx.x - leftIrisPx.x
-        val distPxH = abs(dx)
+        val distPxH = abs(rightIrisPx.x - leftIrisPx.x)
+        val irisY = (leftIrisPx.y + rightIrisPx.y) * 0.5f
 
         // ---------- NARIZ / BOCA -> MIDLINE ----------
         var noseTipPx: PointF? = null
@@ -164,49 +180,37 @@ class IrisDnpLandmarker3250(
             val pts = ArrayList<PointF>(4)
             pts += noseTip
             pts += mouthC
-            landmarks.getOrNull(IDX_NOSE_BRIDGE)?.let { lm -> pts += PointF(lm.x() * w, lm.y() * h) }
+            landmarks.getOrNull(IDX_NOSE_BRIDGE)
+                ?.let { lm -> pts += PointF(lm.x() * w, lm.y() * h) }
             landmarks.getOrNull(IDX_CHIN)?.let { lm -> pts += PointF(lm.x() * w, lm.y() * h) }
 
             val ab = fitLineXonY3250(pts)
             if (ab != null) {
                 val (a0, b0) = ab
-
-                // y de referencia: línea de irises (promedio)
-                val irisY = (leftIrisPx.y + rightIrisPx.y) * 0.5f
-
-                // x en ese y según fit
                 var xMid = xAtY3250(a0, b0, irisY)
 
-                // guardrail: SIEMPRE entre irises (con margen)
+                // guardrail: SIEMPRE entre irises (margen)
                 val lo = leftIrisPx.x + 6f
                 val hi = rightIrisPx.x - 6f
-                val hasRoom = hi > lo
-                if (hasRoom) xMid = xMid.coerceIn(lo, hi)
+                if (hi > lo) xMid = xMid.coerceIn(lo, hi)
 
-                // ✅ CLAVE: re-anclar la recta para que pase por (irisY, xMid clamped)
+                // re-anclar recta para pasar por (irisY, xMid)
                 val bAdj = xMid - a0 * irisY
 
-                // sanity de pendiente: si se va a la mierda, fallback vertical
-                val dxOverH = a0 * h // delta X entre y=0..h
+                // sanity pendiente
+                val dxOverH = a0 * h
                 val slopeOk = dxOverH.isFinite() && abs(dxOverH) <= (w * 0.75f)
 
                 if (slopeOk) {
-                    val xA = xAtY3250(a0, bAdj, 0f)
-                    val xB = xAtY3250(a0, bAdj, h)
-
-                    midlineApx = PointF(xA, 0f)
-                    midlineBpx = PointF(xB, h)
+                    midlineApx = PointF(xAtY3250(a0, bAdj, 0f), 0f)
+                    midlineBpx = PointF(xAtY3250(a0, bAdj, h), h)
                     midlineXpx = xMid
                 } else {
-                    // fallback vertical en xMid (ya clamp entre irises)
                     midlineXpx = xMid
                     midlineApx = PointF(xMid, 0f)
                     midlineBpx = PointF(xMid, h)
                 }
-
-                Log.d(TAG, "MID3250 fit a=$a0 b0=$b0 -> bAdj=$bAdj irisY=$irisY xMid=$midlineXpx slopeOk=$slopeOk")
             } else {
-                // fallback vertical
                 val xMid0 = ((lmNose.x() + (lmUp.x() + lmLo.x()) * 0.5f) * 0.5f) * w
                 val xMid = xMid0.coerceIn(0f, w - 1f)
                 midlineXpx = xMid
@@ -227,19 +231,25 @@ class IrisDnpLandmarker3250(
         var lb = browBottom(LEFT_BROW)
         var rb = browBottom(RIGHT_BROW)
 
+        // asegurar orden visual izq/der (por si el modelo invierte)
         if (browCenterX(LEFT_BROW) > browCenterX(RIGHT_BROW)) {
             val t = lb; lb = rb; rb = t
         }
 
+        // ✅ guardrail: browBottom debe estar ARRIBA del nivel de irises
         val margin = 6f
-        val leftBrow = lb.takeIf { it < leftIrisPx.y - margin }
-        val rightBrow = rb.takeIf { it < rightIrisPx.y - margin }
+        val leftBrow = lb.takeIf { it.isFinite() && it < irisY - margin }
+        val rightBrow = rb.takeIf { it.isFinite() && it < irisY - margin }
+
+        // ✅ ojos como elipses (global px)  ← ESTA es la fuente “eyes”
+        val eyes = buildEyeEllipsesGlobal3250(landmarks, w, h)
 
         // ---------- ESCALA ----------
         val scale = pxPerMmOverride3250 ?: pxPerMm3250
         val distMm = scale?.takeIf { it > 0f }?.let { distPxH / it }
-        val hasScale = scale != null && scale > 0f
+        val hasScale = (scale != null && scale > 0f)
 
+        // legacy/debug
         val maskPolys = buildMaskPolysGlobal3250(landmarks, w, h)
 
         return DnpMeasurementResult3250(
@@ -256,6 +266,7 @@ class IrisDnpLandmarker3250(
             midlineXpx = midlineXpx,
             midlineApx = midlineApx,
             midlineBpx = midlineBpx,
+            eyeEllipsesGlobal3250 = eyes,
             maskPolysGlobal3250 = maskPolys,
             leftBrowBottomYpx = leftBrow,
             rightBrowBottomYpx = rightBrow
@@ -331,7 +342,10 @@ class IrisDnpLandmarker3250(
     private fun xAtY3250(a: Float, b: Float, y: Float): Float = a * y + b
 
     override fun close() {
-        try { landmarker.close() } catch (_: Throwable) {}
+        try {
+            landmarker.close()
+        } catch (_: Throwable) {
+        }
     }
 
     object FaceMaskHull3250 {
@@ -348,24 +362,63 @@ class IrisDnpLandmarker3250(
             if (byAngle.isEmpty()) return listOf(pivot)
 
             val stack = mutableListOf(pivot, byAngle.first())
-
             for (i in 1 until byAngle.size) {
                 val p = byAngle[i]
-
                 while (stack.size >= 2) {
                     val top = stack[stack.size - 1]
                     val second = stack[stack.size - 2]
-
                     val cross = (top.x - second.x) * (p.y - second.y) -
                             (top.y - second.y) * (p.x - second.x)
-
                     if (cross <= 0) stack.removeAt(stack.size - 1) else break
                 }
-
                 stack.add(p)
             }
-
             return stack
         }
+    }
+
+    // ------------------------------
+    // Eye ellipses (Suggestion B)
+    // ------------------------------
+    private fun lmPx(lm: NormalizedLandmark, w: Float, h: Float): PointF =
+        PointF(lm.x() * w, lm.y() * h)
+
+    private fun buildEyeEllipsesGlobal3250(
+        landmarks: List<NormalizedLandmark>,
+        w: Float,
+        h: Float
+    ): List<EyeEllipseMask3250> {
+
+        fun ellipseFrom(idx: IntArray): EyeEllipseMask3250 {
+            var minX = Float.POSITIVE_INFINITY
+            var maxX = Float.NEGATIVE_INFINITY
+            var minY = Float.POSITIVE_INFINITY
+            var maxY = Float.NEGATIVE_INFINITY
+
+            for (i in idx) {
+                val p = lmPx(landmarks[i], w, h)
+                if (p.x < minX) minX = p.x
+                if (p.x > maxX) maxX = p.x
+                if (p.y < minY) minY = p.y
+                if (p.y > maxY) maxY = p.y
+            }
+
+            val cx = (minX + maxX) * 0.5f
+            val cy = (minY + maxY) * 0.5f
+            val rx = ((maxX - minX) * 0.5f).coerceAtLeast(6f)
+            val ry = ((maxY - minY) * 0.5f).coerceAtLeast(6f)
+
+            return EyeEllipseMask3250(
+                centerPx = PointF(cx, cy),
+                rxPx = rx,
+                ryPx = ry,
+                angleDeg = 0f
+            )
+        }
+
+        return listOf(
+            ellipseFrom(LEFT_EYE),
+            ellipseFrom(RIGHT_EYE)
+        )
     }
 }

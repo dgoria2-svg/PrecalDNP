@@ -6,9 +6,9 @@ import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
-import android.os.Build
 import android.provider.MediaStore
 import android.util.Log
+import androidx.core.graphics.createBitmap
 import java.io.OutputStream
 import kotlin.math.abs
 import kotlin.math.cos
@@ -19,16 +19,18 @@ import kotlin.math.min
  * ✅ ÚNICA fuente de EDGE MAP 3250.
  *
  * Regla: still -> edgeMapFull (binario 0/255) UNA VEZ.
- * - RimDetector trabaja SOLO sobre edgeMap (recortando ROIs)
+ * - RimDetector trabaja SOLO sobre edgeMap (recortando ROI)
  * - ArcFit trabaja SOLO sobre edgeMap (nunca regenera bordes)
  *
- * DEBUG: puede dumpear el edgeMap (y opcionalmente gray) a Galería desde acá mismo.
+ * maskFull (si se pasa) está en coords FULL (w*h) y se usa:
+ * - ✅ SOLO para stats y dumps DEBUG (ver qué pasaría con censura post-edge).
+ * - ❌ NO altera el edgeMapFull (NO flatten, NO scoreWeight, NO hard-kill).
+ *
+ * La censura/marker (ojo/ceja) se aplica en RimDetector (post-edge), no acá.
  */
 object EdgeMapBuilder3250 {
 
     private const val TAG = "EdgeMapBuilder3250"
-
-    enum class EdgeMode3250 { LEGACY, DIVINE }
 
     // ------------------------------------------------------------
     // Parámetros (FULL)
@@ -40,7 +42,6 @@ object EdgeMapBuilder3250 {
     private const val EDGE_THR_FRAC = 0.16f
     private const val EDGE_THR_MIN = 6
 
-    private const val HYST_LOW_FRAC = 0.50f
     private const val P95_CAP_K = 1.10f
 
     private const val TAN22_NUM = 41
@@ -48,21 +49,32 @@ object EdgeMapBuilder3250 {
     private const val TAN67_NUM = 241
     private const val TAN67_DEN = 100
 
+    // ✅ Engrosar edgeMap (dilate) DESPUÉS de hysteresis (0/255)
+    private const val THICKEN_RADIUS_PX = 1   // 1 => kernel 3x3
+    private const val THICKEN_ITERS = 1
+
     private const val DIR_MAX_ANGLE_DEG = 25f
     @Suppress("unused")
     private val DIR_COS_TOL: Float = cos(Math.toRadians(DIR_MAX_ANGLE_DEG.toDouble())).toFloat()
 
-    // DEBUG: si el still es gigante, conviene bajar tamaño del PNG debug
     private const val DEBUG_MAX_DIM_PX = 1600
 
-    // ✅ Filtros NO destructivos (evitan “cajas negras”)
-    // 1) TopKill suave: rampa lineal desde y=0 hasta y=topKillY.
-    //    Arriba reduce score, pero NO anula todo.
-    private const val TOPKILL_MIN_WEIGHT = 0.10f  // 10% del score arriba (para que nunca quede negro)
-    // 2) Mask suave: en pixels masked usamos blur (flatten) y además reducimos score.
-    private const val MASK_SCORE_WEIGHT = 0.40f   // 40% del score en zona mask (evita textura sin agujeros)
+    // ✅ TopKill suave: rampa lineal desde y=0 hasta y=topKillY.
+    private const val TOPKILL_MIN_WEIGHT = 0.10f
 
-    // Mantiene tu EdgeStats tal cual:
+    // ============================================================
+    // ✅ MASK DEBUG (se mantiene para no romper nombres / lógica)
+    // ============================================================
+
+    // 0 = sin dilatar mask (RECOMENDADO para no comerte el aro)
+    private const val MASK_DILATE_RADIUS_PX = 0
+
+    // Estos dos quedan “sin efecto” en la construcción del edgeMap (por diseño).
+    @Suppress("unused")
+    private const val MASK_FLATTEN_BLEND = 0.35f   // (NO usado)
+    @Suppress("unused")
+    private const val MASK_SCORE_WEIGHT = 0.85f    // (NO usado)
+
     data class EdgeStats(
         val maxScore: Float,
         val p95Score: Float,
@@ -71,26 +83,30 @@ object EdgeMapBuilder3250 {
         val density: Float,
         val bandPx: Float,
         val samples: Int,
-        val topKillY: Int
+        val topKillY: Int,
+        val maskedN: Int,
+        val maskedFrac: Float,
+        val maskDilateR: Int
     )
 
-    // ✅ Nuevo: pack de salida (edges + dir + stats)
-    data class EdgeMapOut3250(
+    /**
+     * ✅ Salida ÚNICA del builder: edges + dir + stats (FULL).
+     */
+    class EdgeMapOut3250(
         val w: Int,
         val h: Int,
-        val edgesU8: ByteArray, // 0/255 post-hysteresis
-        val dirU8: ByteArray,   // dir cuantizada por pixel (mismo N)
+        val edgesU8: ByteArray, // 0/255 post-hysteresis (+thicken)
+        val dirU8: ByteArray,   // 0..3 para píxeles NMS; 255 para píxeles agregados por thicken
         val stats: EdgeStats
     )
-
 
     private fun u8(b: Byte): Int = b.toInt() and 0xFF
 
     // ============================================================
-    // ✅ FULL FRAME: Bitmap -> EdgeMap (0/255)
+    // ✅ FULL FRAME: Bitmap -> EdgeMapOut3250 (edges + dir + stats)
     // ============================================================
 
-    fun buildFullFrameEdgeMapFromBitmap3250(
+    fun buildFullFrameEdgePackFromBitmap3250(
         stillBmp: Bitmap,
         borderKillPx: Int,
         topKillY: Int = 0,
@@ -98,18 +114,21 @@ object EdgeMapBuilder3250 {
         debugTag: String = "FULL",
         statsOut: ((EdgeStats) -> Unit)? = null,
 
-        // ✅ DEBUG integrado
+        // DEBUG opcional
         ctx: Context? = null,
         debugSaveToGallery3250: Boolean = false,
         debugAlsoSaveGray3250: Boolean = false
-    ): ByteArray {
+    ): EdgeMapOut3250 {
+
         val w = stillBmp.width
         val h = stillBmp.height
-        if (w <= 0 || h <= 0) return ByteArray(0)
+        if (w <= 0 || h <= 0) {
+            val st = EdgeStats(0f, 0f, 0f, 0, 0f, 0f, 0, topKillY, 0, 0f, 0)
+            return EdgeMapOut3250(0, 0, ByteArray(0), ByteArray(0), st)
+        }
 
         val gray = ByteArray(w * h)
         val row = IntArray(w)
-
         for (y in 0 until h) {
             stillBmp.getPixels(row, 0, w, 0, y, w, 1)
             val off = y * w
@@ -123,7 +142,7 @@ object EdgeMapBuilder3250 {
             }
         }
 
-        val out = buildFullFrameEdgeMapFromGrayU8_3250(
+        val pack = buildFullFrameEdgePackFromGrayU8_3250(
             w = w,
             h = h,
             grayU8 = gray,
@@ -134,7 +153,7 @@ object EdgeMapBuilder3250 {
             statsOut = statsOut
         )
 
-        // ✅ Dump integrado (FULL)
+        // ✅ DEBUG: triplete limpio (GRAY opcional + EDGE_FULL + MASK + EDGE_USED post-edge)
         if (debugSaveToGallery3250 && ctx != null) {
             try {
                 if (debugAlsoSaveGray3250) {
@@ -147,32 +166,26 @@ object EdgeMapBuilder3250 {
                         invert = false
                     )
                 }
-                saveU8ToGalleryAsPng3250(
+                debugDumpEdgeTriplet3250(
                     ctx = ctx,
-                    u8 = out,
                     w = w,
                     h = h,
-                    displayName = "EDGE_FULL_${debugTag}_${System.currentTimeMillis()}.png",
-                    invert = false
+                    edgesFullU8 = pack.edgesU8,
+                    maskFullU8 = maskFull,
+                    debugTag = debugTag
                 )
-                Log.d(TAG, "EDGE dump saved to gallery (tag=$debugTag)")
             } catch (t: Throwable) {
                 Log.e(TAG, "EDGE dump save failed", t)
             }
         }
 
-        return out
+        return pack
     }
 
-    /**
-     * ✅ Versión corregida: devuelve el pack completo (edges + dir + stats).
-     *
-     * Nota: tus helpers/constantes se asumen existentes:
-     * - boxBlur3x3U8, u8
-     * - quantizeDir3250, nmsNeighbors3250
-     * - percentileFromHist3250, computeThrHigh3250
-     * - TOPKILL_MIN_WEIGHT, MASK_SCORE_WEIGHT, K_H, K_V, EDGE_THR_MIN, HYST_LOW_FRAC
-     */
+    // ============================================================
+    // ✅ FULL FRAME: GrayU8 -> EdgeMapOut3250
+    // ============================================================
+
     fun buildFullFrameEdgePackFromGrayU8_3250(
         w: Int,
         h: Int,
@@ -185,7 +198,7 @@ object EdgeMapBuilder3250 {
     ): EdgeMapOut3250 {
 
         if (w <= 0 || h <= 0) {
-            val st = EdgeStats(0f, 0f, 0f, 0, 0f, 0f, 0, topKillY)
+            val st = EdgeStats(0f, 0f, 0f, 0, 0f, 0f, 0, topKillY, 0, 0f, 0)
             return EdgeMapOut3250(0, 0, ByteArray(0), ByteArray(0), st)
         }
 
@@ -193,42 +206,44 @@ object EdgeMapBuilder3250 {
 
         if (grayU8.size != N) {
             Log.w(TAG, "EDGE_FULL[$debugTag] bad gray size=${grayU8.size} N=$N")
-            val st = EdgeStats(0f, 0f, 0f, 0, 0f, 0f, 0, topKillY.coerceIn(0, h))
+            val st = EdgeStats(0f, 0f, 0f, 0, 0f, 0f, 0, topKillY.coerceIn(0, h), 0, 0f, 0)
             return EdgeMapOut3250(w, h, ByteArray(N), ByteArray(N), st)
         }
         if (maskFull != null && maskFull.size != N) {
             Log.w(TAG, "EDGE_FULL[$debugTag] bad mask size=${maskFull.size} N=$N")
-            val st = EdgeStats(0f, 0f, 0f, 0, 0f, 0f, 0, topKillY.coerceIn(0, h))
+            val st = EdgeStats(0f, 0f, 0f, 0, 0f, 0f, 0, topKillY.coerceIn(0, h), 0, 0f, 0)
             return EdgeMapOut3250(w, h, ByteArray(N), ByteArray(N), st)
         }
 
         val B = borderKillPx.coerceIn(0, min(w, h) / 3)
 
-        // ✅ yKill: si viene fuera de rango, lo tratamos como "sin topkill"
         val yKill = topKillY.coerceIn(0, h)
         val hasTopKill = (yKill in 1 until h)
 
-        // blur para flattening (mask)
-        val blurU8 = boxBlur3x3U8(grayU8, w, h)
+        // ✅ mask dilatada opcional (por defecto 0) — SOLO stats/debug
+        val hasMaskIn = (maskFull != null)
+        val maskWork: ByteArray? = if (hasMaskIn && MASK_DILATE_RADIUS_PX > 0) {
+            dilateMaskU8_3250(maskFull, w, h, radius = MASK_DILATE_RADIUS_PX)
+        } else maskFull
 
-        // score y dir para NMS
-        val score = ShortArray(N)
-        val dir = ByteArray(N)
-        var maxScore = 0
-        var validCount = 0
-
-        val hasMask = (maskFull != null)
+        val hasMask = (maskWork != null)
 
         fun isMasked(i: Int): Boolean =
-            hasMask && ((maskFull!![i].toInt() and 0xFF) != 0)
+            hasMask && ((maskWork[i].toInt() and 0xFF) != 0)
+
+        // stats mask (NO afecta edges)
+        var maskedN = 0
+        if (hasMask) {
+            for (i in 0 until N) if (isMasked(i)) maskedN++
+        }
+        val maskedFrac = maskedN.toFloat() / N.toFloat().coerceAtLeast(1f)
 
         fun pix(i: Int): Int {
-            // ✅ Flatten: si masked => blur; si no => gray
-            return if (isMasked(i)) u8(blurU8[i]) else u8(grayU8[i])
+            // ✅ EDGE_FULL “puro”: NO flatten, NO scoreWeight por máscara
+            return u8(grayU8[i])
         }
 
         fun topWeight(y: Int): Float {
-            // ✅ TopKill suave: arriba de yKill reduce score gradualmente pero nunca 0.
             if (!hasTopKill) return 1f
             if (y >= yKill) return 1f
             val t = y.toFloat() / yKill.toFloat().coerceAtLeast(1f) // 0..1
@@ -236,11 +251,15 @@ object EdgeMapBuilder3250 {
                 .coerceIn(TOPKILL_MIN_WEIGHT, 1f)
         }
 
-        // Precompute (evitás truncado distinto por pixel)
+        val score = ShortArray(N)
+        val dir = ByteArray(N)
+        var maxScore = 0
+        var validCount = 0
+
         val kH100 = (K_H * 100f).toInt()
         val kV100 = (K_V * 100f).toInt()
 
-        // Pass 1: Scharr + score + dir + max
+        // Pass 1: Scharr + score + dir + max (sin máscara)
         for (y in 1 until (h - 1)) {
             if (y < B || y >= h - B) continue
             val tw = topWeight(y)
@@ -252,10 +271,6 @@ object EdgeMapBuilder3250 {
             for (x in 1 until (w - 1)) {
                 if (x < B || x >= w - B) continue
                 val i = off + x
-
-                // ✅ NO kill por mask. Solo penalizamos score si masked.
-                val mw = if (isMasked(i)) MASK_SCORE_WEIGHT else 1f
-                val wScore = tw * mw
 
                 val p00 = pix(offUp + (x - 1))
                 val p01 = pix(offUp + x)
@@ -276,11 +291,9 @@ object EdgeMapBuilder3250 {
                 val vs100 = ax * 100 - kV100 * ay
                 val s100 = max(0, max(hs100, vs100))
                 var s = (s100 / 100).coerceIn(0, 32767)
-
                 if (s == 0) continue
 
-                // ✅ aplicar pesos NO destructivos
-                s = (s.toFloat() * wScore).toInt().coerceIn(0, 32767)
+                s = (s.toFloat() * tw).toInt().coerceIn(0, 32767)
                 if (s == 0) continue
 
                 score[i] = s.toShort()
@@ -292,7 +305,10 @@ object EdgeMapBuilder3250 {
         }
 
         if (validCount < 256 || maxScore <= 0) {
-            Log.w(TAG, "EDGE_FULL[$debugTag] not enough signal valid=$validCount max=$maxScore topKillY=$yKill B=$B hasMask=$hasMask")
+            Log.w(
+                TAG,
+                "EDGE_FULL[$debugTag] not enough signal valid=$validCount max=$maxScore topKillY=$yKill B=$B hasMask=$hasMask"
+            )
             val st = EdgeStats(
                 maxScore = maxScore.toFloat(),
                 p95Score = 0f,
@@ -301,41 +317,31 @@ object EdgeMapBuilder3250 {
                 density = 0f,
                 bandPx = 0f,
                 samples = validCount,
-                topKillY = yKill
+                topKillY = yKill,
+                maskedN = maskedN,
+                maskedFrac = maskedFrac,
+                maskDilateR = MASK_DILATE_RADIUS_PX
             )
             statsOut?.invoke(st)
             return EdgeMapOut3250(w, h, ByteArray(N), dir, st)
         }
 
-        // Pass 2: hist p95
+        // Pass 2: hist p95 (preferible sin masked, así el thr refleja el aro)
+        // Pass 2: hist p95 (SIN máscara; máscara NO altera edgeMapFull)
         val bins = 2048
         val hist = IntArray(bins)
-
-        // ✅ Recomendado: p95 sin masked para que no te mueva umbrales.
-        // Si quedás sin muestras, cae al modo "all".
         var histN = 0
         for (i in 0 until N) {
-            if (hasMask && isMasked(i)) continue
             val s = score[i].toInt()
             if (s <= 0) continue
             val bin = (s * (bins - 1)) / maxScore
             hist[bin]++
             histN++
         }
-        if (histN < 128) {
-            // fallback a todo
-            java.util.Arrays.fill(hist, 0)
-            for (i in 0 until N) {
-                val s = score[i].toInt()
-                if (s <= 0) continue
-                val bin = (s * (bins - 1)) / maxScore
-                hist[bin]++
-            }
-        }
 
-        val p95 = percentileFromHist3250(hist, bins, maxScore, 0.95f)
+        val p95 = percentileFromHist3250(hist, bins, maxScore, 0.995f)  // antes 0.95f
         val thrHigh = computeThrHigh3250(maxScore, p95)
-        val thrLow = max(EDGE_THR_MIN, (thrHigh * HYST_LOW_FRAC).toInt())
+        val thrLow  = max(EDGE_THR_MIN, (thrHigh * 0.85f).toInt())     // subí LOW (0.60–0.70)
 
         // Pass 3: NMS + weak/strong
         val classMap = ByteArray(N) // 0 none, 1 weak, 2 strong
@@ -370,7 +376,10 @@ object EdgeMapBuilder3250 {
         // Pass 4: hysteresis BFS
         val out = ByteArray(N)
         if (strongCount == 0 || candCount == 0) {
-            Log.w(TAG, "EDGE_FULL[$debugTag] no strong/candidates (strong=$strongCount cand=$candCount) thrH=$thrHigh thrL=$thrLow")
+            Log.w(
+                TAG,
+                "EDGE_FULL[$debugTag] no strong/candidates (strong=$strongCount cand=$candCount) thrH=$thrHigh thrL=$thrLow"
+            )
             val st = EdgeStats(
                 maxScore = maxScore.toFloat(),
                 p95Score = p95.toFloat(),
@@ -379,7 +388,10 @@ object EdgeMapBuilder3250 {
                 density = 0f,
                 bandPx = 0f,
                 samples = validCount,
-                topKillY = yKill
+                topKillY = yKill,
+                maskedN = maskedN,
+                maskedFrac = maskedFrac,
+                maskDilateR = MASK_DILATE_RADIUS_PX
             )
             statsOut?.invoke(st)
             return EdgeMapOut3250(w, h, out, dir, st)
@@ -388,14 +400,12 @@ object EdgeMapBuilder3250 {
         val q = IntArray(candCount)
         var qh = 0
         var qt = 0
-        var nnz = 0
 
         // seed: strong
         for (i in 0 until N) {
             if (classMap[i].toInt() == 2) {
                 out[i] = 0xFF.toByte()
                 q[qt++] = i
-                nnz++
             }
         }
 
@@ -416,59 +426,50 @@ object EdgeMapBuilder3250 {
                     classMap[j] = 2
                     out[j] = 0xFF.toByte()
                     q[qt++] = j
-                    nnz++
                 }
             }
         }
 
-        val dens = nnz.toFloat() / N.toFloat().coerceAtLeast(1f)
+        // ✅ Engrosar (dilate) el edgeMap FINAL (0/255)
+        val outThick = thickenEdgeMapU8_3250(out, w, h, radius = THICKEN_RADIUS_PX, iters = THICKEN_ITERS)
+
+        // ✅ Dir: para píxeles "nuevos" agregados por el engrosado, 255 para NO filtrar orientación
+        val dirThick = dir.copyOf()
+        for (i in 0 until N) {
+            val eNew = outThick[i].toInt() and 0xFF
+            if (eNew == 0) continue
+            val eOld = out[i].toInt() and 0xFF
+            if (eOld == 0) dirThick[i] = 0xFF.toByte()
+        }
+
+        var nnzFinal = 0
+        for (b in outThick) if ((b.toInt() and 0xFF) != 0) nnzFinal++
+        val dens = nnzFinal.toFloat() / N.toFloat().coerceAtLeast(1f)
 
         Log.d(
             TAG,
             "EDGE_FULL[$debugTag] max=$maxScore p95=$p95 thrH=$thrHigh thrL=$thrLow " +
-                    "strong=$strongCount cand=$candCount nnz=$nnz/$N dens=${"%.4f".format(dens)} " +
-                    "topKillY=$yKill B=$B hasMask=$hasMask"
+                    "strong=$strongCount cand=$candCount nnz=$nnzFinal/$N dens=${"%.4f".format(dens)} " +
+                    "topKillY=$yKill B=$B hasMask=$hasMask maskDilR=$MASK_DILATE_RADIUS_PX maskedN=$maskedN frac=${"%.4f".format(maskedFrac)} " +
+                    "thickR=$THICKEN_RADIUS_PX thickI=$THICKEN_ITERS"
         )
 
         val st = EdgeStats(
             maxScore = maxScore.toFloat(),
             p95Score = p95.toFloat(),
             thr = thrHigh.toFloat(),
-            nnz = nnz,
+            nnz = nnzFinal,
             density = dens,
             bandPx = 0f,
             samples = validCount,
-            topKillY = yKill
+            topKillY = yKill,
+            maskedN = maskedN,
+            maskedFrac = maskedFrac,
+            maskDilateR = MASK_DILATE_RADIUS_PX
         )
         statsOut?.invoke(st)
 
-        return EdgeMapOut3250(w, h, out, dir, st)
-    }
-
-    /**
-     * ✅ Wrapper para no romper call-sites: mantiene TU firma original y devuelve ByteArray.
-     * Si querés dir/stats, llamás al pack y usás .dirU8 / .stats
-     */
-    fun buildFullFrameEdgeMapFromGrayU8_3250(
-        w: Int,
-        h: Int,
-        grayU8: ByteArray,
-        borderKillPx: Int,
-        topKillY: Int = 0,
-        maskFull: ByteArray? = null,
-        debugTag: String = "FULL",
-        statsOut: ((EdgeStats) -> Unit)? = null
-    ): ByteArray {
-        return buildFullFrameEdgePackFromGrayU8_3250(
-            w = w,
-            h = h,
-            grayU8 = grayU8,
-            borderKillPx = borderKillPx,
-            topKillY = topKillY,
-            maskFull = maskFull,
-            debugTag = debugTag,
-            statsOut = statsOut
-        ).edgesU8
+        return EdgeMapOut3250(w, h, outThick, dirThick, st)
     }
 
     // ============================================================
@@ -489,7 +490,7 @@ object EdgeMapBuilder3250 {
         val outW = (w * scale).toInt().coerceAtLeast(1)
         val outH = (h * scale).toInt().coerceAtLeast(1)
 
-        val bmp = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
+        val bmp = createBitmap(outW, outH)
         val row = IntArray(outW)
 
         for (yy in 0 until outH) {
@@ -507,10 +508,8 @@ object EdgeMapBuilder3250 {
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
             put(MediaStore.Images.Media.MIME_TYPE, "image/png")
-            if (Build.VERSION.SDK_INT >= 29) {
-                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/debug3250")
-                put(MediaStore.Images.Media.IS_PENDING, 1)
-            }
+            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/debug3250")
+            put(MediaStore.Images.Media.IS_PENDING, 1)
         }
 
         val resolver = ctx.contentResolver
@@ -523,11 +522,9 @@ object EdgeMapBuilder3250 {
             resolver.openOutputStream(uri)?.use { os: OutputStream ->
                 bmp.compress(Bitmap.CompressFormat.PNG, 100, os)
             }
-            if (Build.VERSION.SDK_INT >= 29) {
-                values.clear()
-                values.put(MediaStore.Images.Media.IS_PENDING, 0)
-                resolver.update(uri, values, null, null)
-            }
+            values.clear()
+            values.put(MediaStore.Images.Media.IS_PENDING, 0)
+            resolver.update(uri, values, null, null)
             return uri
         } catch (t: Throwable) {
             Log.e(TAG, "saveU8ToGalleryAsPng3250 failed uri=$uri", t)
@@ -544,45 +541,133 @@ object EdgeMapBuilder3250 {
     }
 
     // ============================================================
+    // ✅ DEBUG TRIPLETE: EDGE_FULL / MASK / EDGE_USED(post-edge)
+    // ============================================================
+
+    private fun applyMaskPostEdge3250(edgesU8: ByteArray, maskU8: ByteArray): ByteArray {
+        val out = edgesU8.copyOf()
+        val n = min(out.size, maskU8.size)
+        for (i in 0 until n) {
+            if ((maskU8[i].toInt() and 0xFF) != 0) out[i] = 0
+        }
+        return out
+    }
+
+    private fun debugDumpEdgeTriplet3250(
+        ctx: Context,
+        w: Int,
+        h: Int,
+        edgesFullU8: ByteArray,
+        maskFullU8: ByteArray?,
+        debugTag: String
+    ) {
+        if (edgesFullU8.size != w * h) return
+
+        // 1) EDGE_FULL (verdad)
+        saveU8ToGalleryAsPng3250(
+            ctx = ctx,
+            u8 = edgesFullU8,
+            w = w,
+            h = h,
+            displayName = "EDGE_FULL_${debugTag}_${System.currentTimeMillis()}.png",
+            invert = false
+        )
+
+        // 2) MASK + 3) EDGE_USED (post-edge) si hay máscara
+        if (maskFullU8 != null && maskFullU8.size == w * h) {
+            saveU8ToGalleryAsPng3250(
+                ctx = ctx,
+                u8 = maskFullU8,
+                w = w,
+                h = h,
+                displayName = "EDGE_MASK_${debugTag}_${System.currentTimeMillis()}.png",
+                invert = false
+            )
+
+            val edgesUsed = applyMaskPostEdge3250(edgesFullU8, maskFullU8)
+            saveU8ToGalleryAsPng3250(
+                ctx = ctx,
+                u8 = edgesUsed,
+                w = w,
+                h = h,
+                displayName = "EDGE_USED_${debugTag}_${System.currentTimeMillis()}.png",
+                invert = false
+            )
+        }
+    }
+
+    // ============================================================
     // Internals
     // ============================================================
 
-    private fun boxBlur3x3U8(grayU8: ByteArray, w: Int, h: Int): ByteArray {
+    private fun dilateMaskU8_3250(mask: ByteArray, w: Int, h: Int, radius: Int): ByteArray {
+        if (radius <= 0) return mask
         val out = ByteArray(w * h)
-        if (w <= 0 || h <= 0) return out
-
-        var prev = IntArray(w)
-        var curr = IntArray(w)
-        var next = IntArray(w)
-
-        fun buildHsumRow(y: Int, dst: IntArray) {
-            val yy = y.coerceIn(0, h - 1)
-            val base = yy * w
-            for (x in 0 until w) {
-                val xm1 = if (x > 0) x - 1 else 0
-                val xp1 = if (x < w - 1) x + 1 else w - 1
-                dst[x] = u8(grayU8[base + xm1]) + u8(grayU8[base + x]) + u8(grayU8[base + xp1])
-            }
-        }
-
-        buildHsumRow(0, curr)
-        buildHsumRow(0, prev)
-        buildHsumRow(if (h > 1) 1 else 0, next)
-
         for (y in 0 until h) {
-            val base = y * w
+            val y0 = max(0, y - radius)
+            val y1 = min(h - 1, y + radius)
+            val rowOut = y * w
             for (x in 0 until w) {
-                val sum = prev[x] + curr[x] + next[x]
-                out[base + x] = (sum / 9).coerceIn(0, 255).toByte()
+                val x0 = max(0, x - radius)
+                val x1 = min(w - 1, x + radius)
+                var hit = false
+                run {
+                    var yy = y0
+                    while (yy <= y1) {
+                        val row = yy * w
+                        var xx = x0
+                        while (xx <= x1) {
+                            if ((mask[row + xx].toInt() and 0xFF) != 0) { hit = true; return@run }
+                            xx++
+                        }
+                        yy++
+                    }
+                }
+                if (hit) out[rowOut + x] = 1
             }
-            val tmp = prev
-            prev = curr
-            curr = next
-            next = tmp
-            buildHsumRow(y + 2, next)
         }
-
         return out
+    }
+
+    private fun thickenEdgeMapU8_3250(
+        edges: ByteArray,
+        w: Int,
+        h: Int,
+        radius: Int = 1,
+        iters: Int = 1
+    ): ByteArray {
+        if (edges.size != w * h || w <= 0 || h <= 0) return edges
+        if (radius <= 0 || iters <= 0) return edges
+
+        var src = edges
+        repeat(iters) {
+            val dst = ByteArray(w * h)
+            for (y in 0 until h) {
+                val y0 = max(0, y - radius)
+                val y1 = min(h - 1, y + radius)
+                val rowOut = y * w
+                for (x in 0 until w) {
+                    val x0 = max(0, x - radius)
+                    val x1 = min(w - 1, x + radius)
+                    var hit = false
+                    run {
+                        var yy = y0
+                        while (yy <= y1) {
+                            val row = yy * w
+                            var xx = x0
+                            while (xx <= x1) {
+                                if ((src[row + xx].toInt() and 0xFF) != 0) { hit = true; return@run }
+                                xx++
+                            }
+                            yy++
+                        }
+                    }
+                    if (hit) dst[rowOut + x] = 0xFF.toByte()
+                }
+            }
+            src = dst
+        }
+        return src
     }
 
     private fun percentileFromHist3250(hist: IntArray, bins: Int, maxScore: Int, q: Float): Int {
@@ -615,7 +700,13 @@ object EdgeMapBuilder3250 {
         return if ((gx xor gy) >= 0) 1 else 3
     }
 
-    private fun nmsNeighbors3250(i: Int, x: Int, y: Int, w: Int, dir: Int): Pair<Int, Int> {
+    private fun nmsNeighbors3250(
+        i: Int,
+        x: Int,
+        y: Int,
+        w: Int,
+        dir: Int
+    ): Pair<Int, Int> {
         return when (dir) {
             0 -> (i - 1) to (i + 1)
             2 -> (i - w) to (i + w)

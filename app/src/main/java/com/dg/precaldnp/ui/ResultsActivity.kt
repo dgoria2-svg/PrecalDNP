@@ -29,6 +29,9 @@ class ResultsActivity : ComponentActivity() {
 
         // DEBUG (por si querés ver dumps)
         const val EXTRA_DEBUG_URI_3250 = "EXTRA_DEBUG_URI_3250"
+
+        // ✅ order id (solo para mostrar en texto)
+        const val EXTRA_ORDER_ID_3250 = "extra_order_id_3250"
     }
 
     private var result: MeasurementResult? = null
@@ -39,6 +42,8 @@ class ResultsActivity : ComponentActivity() {
     private lateinit var btnShare: Button
     private lateinit var btnNext: Button
 
+    private var orderId3250: String? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_results)
@@ -47,6 +52,9 @@ class ResultsActivity : ComponentActivity() {
         tvMetrics = findViewById(R.id.tvMetrics)
         btnShare = findViewById(R.id.btnShare)
         btnNext = findViewById(R.id.btnNext)
+
+        // ✅ order id (viene del launcher, NO del pipeline)
+        orderId3250 = intent.getStringExtra(EXTRA_ORDER_ID_3250)
 
         // 1) Resultado (puede ser null, NO cerramos la pantalla)
         result = savedInstanceState?.getParcelable(STATE_RESULT) ?: run {
@@ -91,7 +99,8 @@ class ResultsActivity : ComponentActivity() {
                 rawExtra = rawExtra,
                 dbgExtra = dbgExtra,
                 viewUri = imgUriForView,
-                shareUri = u
+                shareUri = u,
+                orderId = orderId3250
             )
 
             // fallback silencioso
@@ -137,7 +146,8 @@ class ResultsActivity : ComponentActivity() {
             rawExtra = rawExtra,
             dbgExtra = dbgExtra,
             viewUri = imgUri,
-            shareUri = shareUri
+            shareUri = shareUri,
+            orderId = orderId3250
         )
 
         btnShare.isEnabled = (shareUri != null)
@@ -185,9 +195,10 @@ class ResultsActivity : ComponentActivity() {
         rawExtra: String?,
         dbgExtra: String?,
         viewUri: Uri?,
-        shareUri: Uri?
+        shareUri: Uri?,
+        orderId: String?
     ): String {
-        if (r != null) return buildMetricsText(r)
+        if (r != null) return buildMetricsText(r, orderId)
 
         fun exists(u: Uri?): String {
             if (u == null) return "null"
@@ -203,6 +214,7 @@ class ResultsActivity : ComponentActivity() {
 
         return buildString {
             appendLine("DEBUG RESULT MODE (result=null)")
+            if (!orderId.isNullOrBlank()) appendLine("orderId=$orderId")
             appendLine("rawExtra=${rawExtra ?: "null"}")
             appendLine("dbgExtra=${dbgExtra ?: "null"}")
             appendLine("viewUri=${viewUri ?: "null"} -> ${exists(viewUri)}")
@@ -212,18 +224,31 @@ class ResultsActivity : ComponentActivity() {
         }
     }
 
-    private fun buildMetricsText(r: MeasurementResult): String {
+    private fun buildMetricsText(r: MeasurementResult, orderId: String?): String {
         fun f(x: Double) = if (x.isFinite()) String.format(Locale.US, "%.2f", x) else "-"
 
         val dnpTotalMm =
             if (r.dnpOdMm.isFinite() && r.dnpOiMm.isFinite()) (r.dnpOdMm + r.dnpOiMm) else Double.NaN
 
         return buildString {
+            if (!orderId.isNullOrBlank()) {
+                appendLine(getString(R.string.results_line_order_fmt, orderId))
+            }
+
+            // A/B/Diag (aro)
             appendLine(getString(R.string.results_line_main_fmt, f(r.anchoMm), f(r.altoMm), f(r.diagMayorMm)))
+
+            // puente
             appendLine(getString(R.string.results_line_bridge_fmt, f(r.puenteMm)))
+
+            // DNP
             appendLine(getString(R.string.results_line_dnp_fmt, f(r.dnpOdMm), f(r.dnpOiMm)))
             appendLine(getString(R.string.results_line_dnp_total_fmt, f(dnpTotalMm)))
+
+            // alturas
             appendLine(getString(R.string.results_line_alt_fmt, f(r.altOdMm), f(r.altOiMm)))
+
+            // Ø útil
             append(getString(R.string.results_line_diam_fmt, f(r.diamUtilOdMm), f(r.diamUtilOiMm)))
         }
     }

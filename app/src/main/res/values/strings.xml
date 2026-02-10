@@ -180,15 +180,14 @@ Imprima la guía A4 al 100 % (círculo 75 mm). Verifique que la medida guía (50
     </string>
     <string name="dnp_face_processing_label">Procesando medición DNP…</string>
     <string name="dnp_face_measure_error">No se pudo calcular la medición. Volvé a intentar con otra foto.</string>
-    <string name="dnp_face_measure_ok_fmt">
-        DNP OD: %.1f  OI: %.1f mm · Alt OD: %.1f  OI: %.1f mm
-    </string>
+    <string name="dnp_face_measure_ok_fmt">DNP OD: %1$.1f  OI: %2$.1f mm · Alt OD: %3$.1f  OI: %4$.1f mm</string>
     <string name="results_line_dnp_total_fmt">DNP total: %1$s mm</string>
     <string name="dnp_capturing_best_frames">Capturando…</string>
     <string name="results_line_fil_fmt">FIL HBOX:%1$s VBOX:%2$s DBL:%3$s EYESIZ:%4$s CIRC:%5$s (mm)</string>
     <string name="results_line_scale_arcfit_fmt">Escala:%1$s px/mm · ArcFit rot:%2$s° rms:%3$s px (n=%4$d)</string>
 
-
+    <string name="results_line_order_fmt">Orden: %1$s</string>
+    <string name="results_line_arcfit_fmt">ArcFit rot=%1$s°  rms=%2$s px  n=%3$d</string>
 
     <!-- Resultados DNP / métricas -->
     <string name="metricas">Métricas de la medición</string>

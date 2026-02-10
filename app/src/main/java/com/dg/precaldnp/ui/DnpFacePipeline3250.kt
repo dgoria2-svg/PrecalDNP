@@ -1,5 +1,6 @@
 package com.dg.precaldnp.ui
 
+import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -8,8 +9,8 @@ import android.graphics.PointF
 import android.graphics.RectF
 import android.net.Uri
 import android.os.Environment
+import android.provider.MediaStore
 import android.util.Log
-import android.view.Surface
 import androidx.annotation.StringRes
 import androidx.core.content.FileProvider
 import androidx.exifinterface.media.ExifInterface
@@ -18,14 +19,16 @@ import com.dg.precaldnp.model.DnpShotHint3250
 import com.dg.precaldnp.model.MeasurementResult
 import com.dg.precaldnp.model.ShapeTraceResult
 import com.dg.precaldnp.model.WorkEye3250
+import com.dg.precaldnp.vision.ArcFitAdapter3250
 import com.dg.precaldnp.vision.DebugDump3250
-import com.dg.precaldnp.vision.EdgeArcfitDebugDump3250
+import com.dg.precaldnp.vision.DebugDumpFace3250
 import com.dg.precaldnp.vision.EdgeMapBuilder3250
+import com.dg.precaldnp.vision.EyeEllipseMask3250
 import com.dg.precaldnp.vision.FilContourBuilder3250
-import com.dg.precaldnp.vision.FilPlaceFromArc3250
 import com.dg.precaldnp.vision.IrisDnpLandmarker3250
 import com.dg.precaldnp.vision.PupilFrameEngine3250
 import com.dg.precaldnp.vision.RimArcSeed3250
+import com.dg.precaldnp.vision.RimDetectPack3250
 import com.dg.precaldnp.vision.RimDetectionResult
 import com.dg.precaldnp.vision.RimDetectorBlock3250
 import com.dg.precaldnp.vision.RimRenderSampler3250
@@ -42,6 +45,7 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 
+@Suppress("SameParameterValue")
 object DnpFacePipeline3250 {
 
     private const val TAG = "DnpFacePipeline3250"
@@ -53,7 +57,8 @@ object DnpFacePipeline3250 {
     data class MeasureOut3250(
         val originalUriStr: String,
         val dbgPath3250: String?,
-        val metrics: DnpMetrics3250
+        val metrics: DnpMetrics3250,
+        val finalAnnotatedUriStr3250: String? = null   // ✅ nuevo (no rompe)
     )
 
     data class IrisPack3250(
@@ -64,7 +69,8 @@ object DnpFacePipeline3250 {
         val pLeft: PointF?,
         val pRight: PointF?,
         val browLeftBottomYpx: Float?,
-        val browRightBottomYpx: Float?
+        val browRightBottomYpx: Float?,
+        val eyeEllipsesGlobal3250: List<EyeEllipseMask3250>? = null
     )
 
     data class BoxesPack3250(
@@ -151,14 +157,14 @@ object DnpFacePipeline3250 {
         filVboxMm: Double,
         filOdMm: FilContourBuilder3250.ContourMm3250,
         filOiMm: FilContourBuilder3250.ContourMm3250,
+        orderId3250: String,
         irisEngine: IrisDnpLandmarker3250?,
         pupilEngine: PupilFrameEngine3250,
         filOverInnerMmPerSide: Double,
-        edgeMapFullU8_3250: ByteArray? = null, // ✅ inyección opcional (debug); si null se construye.
         saveRingRoiDebug: Boolean = false,
         saveEdgeArcfitDebugToGallery3250: Boolean = false,
         stage: StageCb3250? = null
-    ): MeasureOut3250? {
+    ): MeasureOut3250 {
 
         val stillBmp = loadBitmapOriented(ctx, savedUri) ?: error("No se pudo leer la foto.")
 
@@ -173,32 +179,29 @@ object DnpFacePipeline3250 {
         val maskFull3250 = buildMaskFullEyesAndBrows3250(
             w = stillBmp.width,
             h = stillBmp.height,
-            iris = iris,
-            boxes = boxes
+            iris = iris
         )
 
-        // 4) ✅ FULL edge map U8 (0/255): UNA sola vez por foto
+        // 4) ✅ FULL edge pack: UNA sola vez por foto
         val w = stillBmp.width
         val h = stillBmp.height
-
         val nFullL = w.toLong() * h.toLong()
         if (nFullL <= 0L || nFullL > Int.MAX_VALUE.toLong()) {
-            Log.e("EDGE3250", "nFull overflow/invalid: w=$w h=$h n=$nFullL")
-            // abortar o bajar resolución del still antes de edge
+            error("EDGE3250: still demasiado grande w=$w h=$h (n=$nFullL)")
         }
-        val nFull = nFullL.toInt()
 
-        val edgeFullU8: ByteArray =
-            edgeMapFullU8_3250?.takeIf { it.size == nFull }
-                ?: EdgeMapBuilder3250.buildFullFrameEdgeMapFromBitmap3250(
-                    stillBmp = stillBmp,
-                    borderKillPx = 4,
-                    topKillY = topKillY3250,
-                    maskFull = maskFull3250,
-                    debugTag = "FACE",
-                    ctx = ctx,
-                    debugSaveToGallery3250 = true
-                )
+        val edgePack = EdgeMapBuilder3250.buildFullFrameEdgePackFromBitmap3250(
+            stillBmp = stillBmp,
+            borderKillPx = 4,
+            topKillY = topKillY3250,
+            maskFull = maskFull3250, // FULL (w*h) => flatten/penaliza, no agujerea
+            debugTag = "FACE",
+            ctx = ctx,
+            debugSaveToGallery3250 = saveEdgeArcfitDebugToGallery3250
+        )
+
+        val edgeFullU8 = edgePack.edgesU8
+        val dirFullU8  = edgePack.dirU8
 
         // 5) Pupilas + midline (solo landmarks/cascade; NO OpenCV midline)
         val pm = resolvePupilsAndMidline3250(
@@ -221,7 +224,8 @@ object DnpFacePipeline3250 {
             saveRingRoiDebug = saveRingRoiDebug
         )
 
-        // 7) RimDetector + ArcFit consumen SOLO edgeFullU8
+        // 7) RimDetector + ArcFit consumen SOLO edgeFullU8 (+ dirFullU8).
+        //    maskFull3250 se usa como "marker" en el barrido del RimDetector (saltos).
         val fit = detectFitAndRefine3250(
             ctx = ctx,
             stillBmp = stillBmp,
@@ -235,6 +239,8 @@ object DnpFacePipeline3250 {
             filOiMm = filOiMm,
             filOverInnerMmPerSide = filOverInnerMmPerSide,
             edgeMapFullU8_3250 = edgeFullU8,
+            dirFullU8_3250 = dirFullU8,
+            maskFullU8_3250 = maskFull3250,
             saveEdgeArcfitDebugToGallery3250 = saveEdgeArcfitDebugToGallery3250,
             stage = stage
         )
@@ -247,30 +253,37 @@ object DnpFacePipeline3250 {
         )
 
         try { roiSrc.rimSrcBmpToRecycle?.recycle() } catch (_: Throwable) {}
+        val finalUriStr = try {
+
+            DnpResultsRoiRenderer3250.renderAndSaveFinalRois3250(
+                ctx = ctx,
+                stillBmp = stillBmp,
+                pm = pm,
+                fit = fit,
+                metrics = metrics,
+                orderId3250 = orderId3250
+            )
+        } catch (_: Throwable) {
+            null
+        }
+        val finalAnnotated = finalUriStr ?: fit.dbgPath3250 ?: savedUri.toString()
 
         return MeasureOut3250(
             originalUriStr = savedUri.toString(),
             dbgPath3250 = fit.dbgPath3250,
-            metrics = metrics
+            metrics = metrics,
+            finalAnnotatedUriStr3250 = finalAnnotated
         )
-    }
 
+    }
     // ============================================================
 
     fun readTextFromUri(ctx: Context, uri: Uri): String? =
         try {
-            ctx.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+            ctx.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
         } catch (_: Throwable) {
             null
         }
-
-    fun surfaceRotationToDegrees3250(rotation: Int): Int = when (rotation) {
-        Surface.ROTATION_0 -> 0
-        Surface.ROTATION_90 -> 90
-        Surface.ROTATION_180 -> 180
-        Surface.ROTATION_270 -> 270
-        else -> 0
-    }
 
     fun buildBaselineShotHint3250(
         viewW: Int,
@@ -384,11 +397,22 @@ object DnpFacePipeline3250 {
     }
 
     private fun clampRectF3250(r: RectF, w: Int, h: Int): RectF {
-        val l = r.left.coerceIn(0f, (w - 1).toFloat())
-        val t = r.top.coerceIn(0f, (h - 1).toFloat())
-        val rr = r.right.coerceIn(0f, (w - 1).toFloat())
-        val bb = r.bottom.coerceIn(0f, (h - 1).toFloat())
-        return RectF(min(l, rr), min(t, bb), max(l, rr), max(t, bb))
+        var l = r.left.coerceIn(0f, w.toFloat())
+        var t = r.top.coerceIn(0f, h.toFloat())
+        var rr = r.right.coerceIn(0f, w.toFloat())
+        var bb = r.bottom.coerceIn(0f, h.toFloat())
+
+        // ordenar
+        val left = min(l, rr)
+        val top = min(t, bb)
+        val right0 = max(l, rr)
+        val bottom0 = max(t, bb)
+
+        // asegurar tamaño mínimo (right/bottom EXCLUSIVOS)
+        val right = right0.coerceIn(left + 1f, w.toFloat())
+        val bottom = bottom0.coerceIn(top + 1f, h.toFloat())
+
+        return RectF(left, top, right, bottom)
     }
 
     private fun mapRectPreviewToStillLinearF(
@@ -413,12 +437,12 @@ object DnpFacePipeline3250 {
 
         return RectF(l, t, r, b)
     }
-
     private fun estimateIrisPack3250(
         ctx: Context,
         stillBmp: Bitmap,
         irisEngine: IrisDnpLandmarker3250?
     ): IrisPack3250 {
+
         val irisRaw = try {
             irisEngine?.estimateDnp(
                 stillBmp,
@@ -439,7 +463,8 @@ object DnpFacePipeline3250 {
                 pLeft = irisRaw.leftIrisCenterPx,
                 pRight = irisRaw.rightIrisCenterPx,
                 browLeftBottomYpx = irisRaw.leftBrowBottomYpx,
-                browRightBottomYpx = irisRaw.rightBrowBottomYpx
+                browRightBottomYpx = irisRaw.rightBrowBottomYpx,
+                eyeEllipsesGlobal3250 = irisRaw.eyeEllipsesGlobal3250
             )
         } else {
             IrisPack3250(false, null, null, null, null, null, null, null)
@@ -729,80 +754,116 @@ object DnpFacePipeline3250 {
             y1 != null && y2 != null -> min(y1, y2)
             y1 != null -> y1
             y2 != null -> y2
-            else -> null
-        } ?: return 0
-
-        // Kill global opcional (suave). Si querés desactivarlo: retorná 0.
+            else -> return 0
+        }
         val pad = 18f
-        return (yMin - pad).roundToInt().coerceIn(0, h.coerceAtLeast(1) - 1)
+        return (yMin - pad).toInt().coerceIn(0, h.coerceAtLeast(1) - 1)
     }
-
     /**
      * Máscara simple (U8): marca zonas de ojos/cejas para que EdgeMapBuilder haga flattening (anti-halo)
      * y no compute edges adentro.
      *
      * Si no hay iris/brows => null (queda sin máscara).
      */
+    private const val MASK_ON: Byte = 0xFF.toByte()
+
     private fun buildMaskFullEyesAndBrows3250(
         w: Int,
         h: Int,
         iris: IrisPack3250,
-        boxes: BoxesPack3250
     ): ByteArray? {
         if (!iris.ok) return null
+        val pL = iris.pLeft
+        val pR = iris.pRight
 
-        val browL = iris.browLeftBottomYpx?.takeIf { it.isFinite() }
-        val browR = iris.browRightBottomYpx?.takeIf { it.isFinite() }
-        if (browL == null && browR == null) return null
+        // Si no tengo al menos centros de iris, no invento.
+        if (pL == null || pR == null) return null
 
         val mask = ByteArray(w * h)
 
-        fun fillRect(r: RectF) {
-            val l = r.left.roundToInt().coerceIn(0, w - 1)
-            val t = r.top.roundToInt().coerceIn(0, h - 1)
-            val rr = r.right.roundToInt().coerceIn(l + 1, w)
-            val bb = r.bottom.roundToInt().coerceIn(t + 1, h)
-            for (yy in t until bb) {
+        fun fillEllipse(cx: Float, cy: Float, rx: Float, ry: Float) {
+            if (!cx.isFinite() || !cy.isFinite() || !rx.isFinite() || !ry.isFinite()) return
+            if (rx <= 2f || ry <= 2f) return
+
+            val x0 = (cx - rx).roundToInt().coerceIn(0, w - 1)
+            val x1 = (cx + rx).roundToInt().coerceIn(0, w - 1)
+            val y0 = (cy - ry).roundToInt().coerceIn(0, h - 1)
+            val y1 = (cy + ry).roundToInt().coerceIn(0, h - 1)
+
+            val invRx2 = 1f / (rx * rx)
+            val invRy2 = 1f / (ry * ry)
+
+            for (yy in y0..y1) {
+                val dy = (yy - cy)
+                val dy2 = dy * dy * invRy2
                 val off = yy * w
-                for (xx in l until rr) {
-                    mask[off + xx] = 1
+                for (xx in x0..x1) {
+                    val dx = (xx - cx)
+                    val v = (dx * dx) * invRx2 + dy2
+                    if (v <= 1f) mask[off + xx] = MASK_ON
                 }
             }
         }
 
-        fun eyeMaskFromBox(box: RectF, browBottomY: Float?) {
-            val bb = browBottomY?.takeIf { it.isFinite() } ?: return
-            val bw = box.width().coerceAtLeast(1f)
-            val bh = box.height().coerceAtLeast(1f)
-
-            val padX = (0.14f * bw).coerceIn(18f, 60f)
-            val padY = (0.16f * bh).coerceIn(16f, 70f)
-
-            // zona superior del box (ceja + párpado) hasta un poco debajo del browBottom
-            val top = (box.top - padY).coerceIn(0f, (h - 1).toFloat())
-            val bottom = (bb + 0.35f * bh).coerceIn(top + 2f, (h - 1).toFloat())
-
-            val r = RectF(
-                (box.left - padX).coerceIn(0f, (w - 1).toFloat()),
-                top,
-                (box.right + padX).coerceIn(0f, (w - 1).toFloat()),
-                bottom
-            )
-            fillRect(r)
+        fun dilate(radius: Int) {
+            if (radius <= 0) return
+            val src = mask.copyOf()
+            for (y in 0 until h) {
+                val y0 = max(0, y - radius)
+                val y1 = min(h - 1, y + radius)
+                for (x in 0 until w) {
+                    val x0 = max(0, x - radius)
+                    val x1 = min(w - 1, x + radius)
+                    var hit = false
+                    var yy = y0
+                    while (yy <= y1 && !hit) {
+                        val off = yy * w
+                        var xx = x0
+                        while (xx <= x1) {
+                            if (src[off + xx].toInt() != 0) { hit = true; break }
+                            xx++
+                        }
+                        yy++
+                    }
+                    if (hit) mask[y * w + x] = MASK_ON
+                }
+            }
         }
 
-        // OJO: browLeft/browRight están en coords STILL, pero “left/right” de iris no siempre coincide con OD/OI.
-        // Acá solo hacemos una máscara útil; la asignación fina OD/OI la hace tu pipeline más abajo.
-        // Usamos ambos browBottom para ambos boxes (robusto).
-        val bbAny = listOfNotNull(browL, browR).minOrNull()
-        val bbAny2 = listOfNotNull(browL, browR).maxOrNull()
+        // Tamaños ROBUSTOS basados en distancia entre iris (px)
+        val d = abs(pR.x - pL.x).coerceIn(40f, (w * 0.90f))
+        val rxBase = (0.25f * d).coerceIn(40f, w * 0.26f)     // ↑ un poco
+        var ryBase = (0.19f * d).coerceIn(30f, h * 0.22f)     // ↑ un poco
+        // anti “tapa media imagen”
+        ryBase = min(ryBase, 0.88f * rxBase)
 
-        eyeMaskFromBox(boxes.boxOdF, bbAny)
-        eyeMaskFromBox(boxes.boxOiF, bbAny2 ?: bbAny)
+        fun addEyeMask(c: PointF) {
+            val cx = c.x.coerceIn(0f, (w - 1).toFloat())
+            val cy = c.y.coerceIn(0f, (h - 1).toFloat())
+
+            // ---- elipse principal agrandada y corrida levemente hacia arriba (asimetría “soft”) ----
+            val rx = (1.12f * rxBase).coerceIn(20f, w * 0.32f)
+            val ry = (1.28f * ryBase).coerceIn(18f, h * 0.28f)
+            val cy2 = (cy - 0.18f * ry).coerceIn(0f, (h - 1).toFloat())
+
+            // ojo/párpado (SIN rectángulos)
+            fillEllipse(cx, cy2, rx, ry)
+
+            // “cap” superior elíptico (tapa pestañas/ceja suave, sin cuadrado)
+            val rxCap = 0.95f * rx
+            val ryCap = 0.55f * ry
+            val cyCap = (cy2 - 0.70f * ry).coerceIn(0f, (h - 1).toFloat())
+            fillEllipse(cx, cyCap, rxCap, ryCap)
+        }
+
+        addEyeMask(pL)
+        addEyeMask(pR)
+
+        // un poquito más grande (sin pasarte)
+        dilate(radius = 5)
 
         return mask
     }
-
     // ============================================================
 
     private fun roiFromMidline40603250(
@@ -839,49 +900,68 @@ object DnpFacePipeline3250 {
             (expWpx * widthScale).coerceAtLeast(expWpx + 80f)
         ).coerceIn(180f, w * 0.95f)
 
-        val roiH = (expHpx * heightScale).coerceAtLeast(expHpx + 90f).coerceIn(180f, h * 0.90f)
-
+        val roiH = (expHpx * heightScale + 90f).coerceIn(180f, h * 0.90f)
         val top = (pupil.y - roiH * pupilYFracFromTop).coerceIn(0f, h - 2f)
         val bottom = (top + roiH).coerceIn(top + 2f, h)
 
-        val gap = gapPx.coerceIn(0f, 60f)
+        val overlap = gapPx.coerceIn(0f, 60f)   // (si querés, después renombrás param a overlapPx)
 
         val midTop = mid.xAt(top, bmpW)
         val midBot = mid.xAt(bottom, bmpW)
+
+        val seamMin = min(midTop, midBot)
+        val seamMax = max(midTop, midBot)
 
         val left: Float
         val right: Float
 
         if (isLeftSide) {
-            val seam = min(midTop, midBot) - gap
-            right = seam.coerceIn(0f, w - 1f)
-            left = (right - roiW).coerceIn(0f, right - 2f)
+            // ✅ ojo izq.: el ROI TIENE que cruzar la midline hacia la derecha
+            right = (seamMax + overlap).coerceIn(2f, w)
+            left  = (right - roiW).coerceIn(0f, right - 2f)
         } else {
-            val seam = max(midTop, midBot) + gap
-            left = seam.coerceIn(0f, w - 1f)
+            // ✅ ojo der: el ROI TIENE que cruzar la midline hacia la izquierda
+            left  = (seamMin - overlap).coerceIn(0f, w - 2f)
             right = (left + roiW).coerceIn(left + 2f, w)
         }
-        Log.d(TAG, "ROI3250 rect L=%.1f T=%.1f R=%.1f B=%.1f".format(left, top, right, bottom))
 
+        val nasalMargin = if (isLeftSide) (midAtRef - right) else (left - midAtRef)
+
+        Log.d(
+            TAG,
+            String.format(
+                Locale.US,
+                "ROI3250 yRef=%.1f midAtRef=%.1f seamMin=%.1f seamMax=%.1f overlap=%.1f nasalMargin=%.1f  L=%.1f R=%.1f T=%.1f B=%.1f roiW=%.1f roiH=%.1f",
+                yRefGlobal, midAtRef, seamMin, seamMax, overlap, nasalMargin,
+                left, right, top, bottom, (right - left), (bottom - top)
+            )
+        )
         return RectF(left, top, right, bottom)
     }
-
     private fun clampRectFToBmp3250(r: RectF, w: Int, h: Int): RectF {
-        val l = r.left.coerceIn(0f, (w - 2).toFloat())
-        val t = r.top.coerceIn(0f, (h - 2).toFloat())
-        val rr = r.right.coerceIn(l + 1f, (w - 1).toFloat())
-        val bb = r.bottom.coerceIn(t + 1f, (h - 1).toFloat())
+        val ww = w.toFloat()
+        val hh = h.toFloat()
+        val l = r.left.coerceIn(0f, ww - 2f)
+        val t = r.top.coerceIn(0f, hh - 2f)
+        val rr = r.right.coerceIn(l + 2f, ww)   // ✅ permite rr==w
+        val bb = r.bottom.coerceIn(t + 2f, hh)  // ✅ permite bb==h
         return RectF(l, t, rr, bb)
     }
 
     private fun rectFToCvRect3250(r: RectF, w: Int, h: Int): Rect {
-        val x = r.left.roundToInt().coerceIn(0, w - 2)
-        val y = r.top.roundToInt().coerceIn(0, h - 2)
-        val ww = r.width().roundToInt().coerceAtLeast(2).coerceAtMost(w - x)
-        val hh = r.height().roundToInt().coerceAtLeast(2).coerceAtMost(h - y)
-        return Rect(x, y, ww, hh)
+        val roi = rectFToRectCoverPx3250(r, w, h)
+        val ww = roi.width().coerceAtLeast(2)
+        val hh = roi.height().coerceAtLeast(2)
+        return Rect(roi.left, roi.top, ww, hh)
     }
 
+    private fun rectFToRectCoverPx3250(r: RectF, w: Int, h: Int): android.graphics.Rect {
+        val l = kotlin.math.floor(r.left).toInt().coerceIn(0, w)
+        val t = kotlin.math.floor(r.top).toInt().coerceIn(0, h)
+        val rr = kotlin.math.ceil(r.right).toInt().coerceIn(l, w)
+        val bb = kotlin.math.ceil(r.bottom).toInt().coerceIn(t, h)
+        return android.graphics.Rect(l, t, rr, bb) // right/bottom EXCLUSIVOS
+    }
     private fun buildRoiAndRimSource3250(
         ctx: Context,
         stillBmp: Bitmap,
@@ -981,14 +1061,13 @@ object DnpFacePipeline3250 {
             browBottomOiY = browBottomOiY
         )
     }
-
     private fun cropBitmap(src: Bitmap, r: RectF): Bitmap? {
-        val l = r.left.toInt().coerceIn(0, src.width - 2)
-        val t = r.top.toInt().coerceIn(0, src.height - 2)
-        val rr = r.right.toInt().coerceIn(l + 1, src.width)
-        val bb = r.bottom.toInt().coerceIn(t + 1, src.height)
+        val roi = rectFToRectCoverPx3250(r, src.width, src.height)
+        val w = roi.width()
+        val h = roi.height()
+        if (w <= 0 || h <= 0) return null
         return try {
-            Bitmap.createBitmap(src, l, t, rr - l, bb - t)
+            Bitmap.createBitmap(src, roi.left, roi.top, w, h)
         } catch (_: Throwable) {
             null
         }
@@ -997,10 +1076,11 @@ object DnpFacePipeline3250 {
     private fun saveDebugBitmap3250(ctx: Context, bmp: Bitmap, namePrefix: String): String? {
         return try {
             val time = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
-            val dir = File(
-                ctx.getExternalFilesDir(Environment.DIRECTORY_PICTURES),
-                "debug3250"
-            ).apply { mkdirs() }
+            val dir =
+                File(
+                    ctx.getExternalFilesDir(Environment.DIRECTORY_PICTURES),
+                    "debug3250"
+                ).apply { mkdirs() }
             val f = File(dir, "${namePrefix}_$time.png")
             FileOutputStream(f).use { out -> bmp.compress(Bitmap.CompressFormat.PNG, 100, out) }
             Log.d(TAG, "DBG saved: ${f.absolutePath}")
@@ -1009,14 +1089,6 @@ object DnpFacePipeline3250 {
             Log.e(TAG, "DBG save error", t)
             null
         }
-    }
-
-    // ============================================================
-
-    private fun fToLocalIntOrNull3250(vGlobal: Float?, x0: Int, limit: Int): Int? {
-        val v = vGlobal ?: return null
-        if (!v.isFinite()) return null
-        return (v - x0.toFloat()).roundToInt().coerceIn(0, (limit - 1).coerceAtLeast(0))
     }
 
     private fun detectFitAndRefine3250(
@@ -1031,20 +1103,24 @@ object DnpFacePipeline3250 {
         filOdMm: FilContourBuilder3250.ContourMm3250,
         filOiMm: FilContourBuilder3250.ContourMm3250,
         filOverInnerMmPerSide: Double,
-        edgeMapFullU8_3250: ByteArray?,                 // ✅ ÚNICA fuente de edges (FULL)
+        edgeMapFullU8_3250: ByteArray,          // FULL edges (0/255)
+        dirFullU8_3250: ByteArray,              // FULL dirU8
+        maskFullU8_3250: ByteArray? = null,     // FULL mask marker
         saveEdgeArcfitDebugToGallery3250: Boolean = false,
         stage: StageCb3250? = null
     ): FitPack3250 {
 
-        // ✅ DIMENSIONES STILL
+        // ============================================================
+        // FULL dims
+        // ============================================================
         val wFull = stillBmp.width
         val hFull = stillBmp.height
         val nFull = wFull * hFull
 
-        if (edgeMapFullU8_3250 == null || edgeMapFullU8_3250.size != nFull) {
+        if (edgeMapFullU8_3250.size != nFull || dirFullU8_3250.size != nFull) {
             Log.e(
                 TAG,
-                "EDGE_FULL missing/bad: edges=${edgeMapFullU8_3250?.size} expected=$nFull. Abort arcfit."
+                "EDGE_FULL mismatch edges=${edgeMapFullU8_3250.size} dir=${dirFullU8_3250.size} N=$nFull"
             )
             return FitPack3250(
                 pxPerMmFaceD = roiSrc.pxPerMmGuessFace.toDouble(),
@@ -1056,60 +1132,140 @@ object DnpFacePipeline3250 {
             )
         }
 
-        // --------- OD ROI (GLOBAL) ----------
+        val maskFullCanon: ByteArray? = maskFullU8_3250?.takeIf { it.size == nFull }
+
+        // ============================================================
+        // Midline overlap (asegurar cruce nasal)
+        // ============================================================
+        val midX = roiSrc.midXBridgeGlobal3250
+        val pxmmGuess = roiSrc.pxPerMmGuessFace
+        val overlapPx = ((pxmmGuess * 25f).takeIf { it.isFinite() && it > 0f } ?: 140f)
+            .coerceIn(80f, 240f)
+
+        val midL = (midX - overlapPx).roundToInt()
+        val midR = (midX + overlapPx).roundToInt()
+
+        // ============================================================
+        // OD ROI (GLOBAL) - forzar cruce midline
+        // ============================================================
         val odL = roiSrc.roiOdRectF.left.toInt().coerceIn(0, wFull - 2)
         val odT = roiSrc.roiOdRectF.top.toInt().coerceIn(0, hFull - 2)
-        val odR = roiSrc.roiOdRectF.right.toInt().coerceIn(odL + 1, wFull)
+        var odR = roiSrc.roiOdRectF.right.toInt().coerceIn(odL + 1, wFull)
         val odB = roiSrc.roiOdRectF.bottom.toInt().coerceIn(odT + 1, hFull)
 
-        val wOd = odR - odL
-        val hOd = odB - odT
-        val edgesOdU8 = ByteArray(wOd * hOd)
+        odR = max(odR, midR).coerceIn(odL + 1, wFull)
+        val roiOdGlobal0 = RectF(odL.toFloat(), odT.toFloat(), odR.toFloat(), odB.toFloat())
 
-        for (yy in 0 until hOd) {
-            System.arraycopy(
-                edgeMapFullU8_3250, (odT + yy) * wFull + odL,
-                edgesOdU8, yy * wOd,
-                wOd
-            )
-        }
-        val roiOdGlobal = RectF(odL.toFloat(), odT.toFloat(), odR.toFloat(), odB.toFloat())
-        val roiOdCvCanon = Rect(odL, odT, wOd, hOd) // ✅ ROI canónico
-
-        // --------- OI ROI (GLOBAL) ----------
-        val oiL = roiSrc.roiOiRectF.left.toInt().coerceIn(0, wFull - 2)
+        // ============================================================
+        // OI ROI (GLOBAL) - forzar cruce midline
+        // ============================================================
+        var oiL = roiSrc.roiOiRectF.left.toInt().coerceIn(0, wFull - 2)
         val oiT = roiSrc.roiOiRectF.top.toInt().coerceIn(0, hFull - 2)
-        val oiR = roiSrc.roiOiRectF.right.toInt().coerceIn(oiL + 1, wFull)
+        val oiR0 = roiSrc.roiOiRectF.right.toInt().coerceIn(oiL + 1, wFull)
         val oiB = roiSrc.roiOiRectF.bottom.toInt().coerceIn(oiT + 1, hFull)
 
-        val wOi = oiR - oiL
-        val hOi = oiB - oiT
-        val edgesOiU8 = ByteArray(wOi * hOi)
+        oiL = min(oiL, midL).coerceIn(0, oiR0 - 1)
+        val roiOiGlobal0 = RectF(oiL.toFloat(), oiT.toFloat(), oiR0.toFloat(), oiB.toFloat())
 
-        for (yy in 0 until hOi) {
-            System.arraycopy(
-                edgeMapFullU8_3250, (oiT + yy) * wFull + oiL,
-                edgesOiU8, yy * wOi,
-                wOi
-            )
+// ============================================================
+// Crop canónico (una sola verdad)
+// ============================================================
+        val odEdges = cropRoiU8(edgeMapFullU8_3250, wFull, hFull, roiOdGlobal0) ?: return FitPack3250(
+            pxPerMmFaceD = roiSrc.pxPerMmGuessFace.toDouble(),
+            placedOdUsed = null, placedOiUsed = null,
+            rimOd = null, rimOi = null,
+            dbgPath3250 = null
+        )
+
+        val roiOdGlobal = odEdges.roiGlobal
+        val edgesOdU8 = odEdges.u8
+        val wOd = odEdges.w
+        val hOd = odEdges.h
+
+        val dirOdU8 = cropRoiU8(dirFullU8_3250, wFull, hFull, roiOdGlobal)?.u8
+            ?: return FitPack3250(roiSrc.pxPerMmGuessFace.toDouble(), null, null, null, null, null)
+
+        val maskOdU8 = maskFullCanon?.let { cropRoiU8(it, wFull, hFull, roiOdGlobal)?.u8 }
+
+// ✅ edges USED (post-veto por máscara) = la verdad que viaja a RimDetector y ArcFit
+        val edgesOdUsed = edgesOdU8.copyOf()
+        if (maskOdU8 != null) {
+            for (i in edgesOdUsed.indices) {
+                if ((maskOdU8[i].toInt() and 0xFF) != 0) edgesOdUsed[i] = 0
+            }
         }
-        val roiOiGlobal = RectF(oiL.toFloat(), oiT.toFloat(), oiR.toFloat(), oiB.toFloat())
-        val roiOiCvCanon = Rect(oiL, oiT, wOi, hOi) // ✅ ROI canónico
 
-        // ---- FIL inner mm
-        val over = filOverInnerMmPerSide.coerceAtLeast(1.0)
-        val hboxInnerMm = (filHboxMm - 2.0 * over).coerceAtLeast(10.0)
-        val vboxInnerMm = (filVboxMm - 2.0 * over).coerceAtLeast(10.0)
+// ---------------- OI ----------------
+        val oiEdges = cropRoiU8(edgeMapFullU8_3250, wFull, hFull, roiOiGlobal0) ?: return FitPack3250(
+            pxPerMmFaceD = roiSrc.pxPerMmGuessFace.toDouble(),
+            placedOdUsed = null, placedOiUsed = null,
+            rimOd = null, rimOi = null,
+            dbgPath3250 = null
+        )
+
+        val roiOiGlobal = oiEdges.roiGlobal
+        val edgesOiU8 = oiEdges.u8
+        val wOi = oiEdges.w
+        val hOi = oiEdges.h
+
+        val dirOiU8 = cropRoiU8(dirFullU8_3250, wFull, hFull, roiOiGlobal)?.u8
+            ?: return FitPack3250(roiSrc.pxPerMmGuessFace.toDouble(), null, null, null, null, null)
+
+        val maskOiU8 = maskFullCanon?.let { cropRoiU8(it, wFull, hFull, roiOiGlobal)?.u8 }
+
+        val edgesOiUsed = edgesOiU8.copyOf()
+        if (maskOiU8 != null) {
+            for (i in edgesOiUsed.indices) {
+                if ((maskOiU8[i].toInt() and 0xFF) != 0) edgesOiUsed[i] = 0
+            }
+        }
+        val roiOdCvCanon =
+            Rect(roiOdGlobal.left.roundToInt(), roiOdGlobal.top.roundToInt(), wOd, hOd)
+        val roiOiCvCanon =
+            Rect(roiOiGlobal.left.roundToInt(), roiOiGlobal.top.roundToInt(), wOi, hOi)
 
         Log.d(
             TAG,
-            "FIL inset: overPerSideMm=$over -> innerHbox=$hboxInnerMm innerVbox=$vboxInnerMm"
+            "ROI3250 midLocal: OD=${midX - roiOdGlobal.left} / wOd=$wOd  OI=${midX - roiOiGlobal.left} / wOi=$wOi overlap=$overlapPx"
         )
+
+        // ============================================================
+        // FIL inner mm (inset)
+        // ============================================================
+        val over = filOverInnerMmPerSide.takeIf { it.isFinite() } ?: 0.5
+        val overClamped = over.coerceIn(0.0, 2.0)
+        val hboxInnerMm = (filHboxMm + 1.0 * overClamped).coerceAtLeast(10.0)
+        val vboxInnerMm = (filVboxMm + 1.0 * overClamped).coerceAtLeast(10.0)
 
         stage?.onStage(R.string.dnp_stage_rim_detecting)
 
-        // ✅ RimDetector trabaja SOBRE el recorte (ROI-local) + roiGlobal
-        val detOd = RimDetectorBlock3250.detectRim(
+// ============================================================
+// DEBUG VISUAL SIEMPRE: FULL edges + overlays + ROIs (aunque falle el detector)
+// ============================================================
+
+        DebugDumpFace3250.dump(
+            context = ctx,
+            inp = DebugDumpFace3250.FaceOverlayInput3250(
+                edgesFullU8 = edgeMapFullU8_3250,
+                wFull = wFull,
+                hFull = hFull,
+                maskFullU8_3250 = maskFullCanon,
+                roiOdGlobal = roiOdGlobal,
+                roiOiGlobal = roiOiGlobal,
+                midlineXpx = roiSrc.midXBridgeGlobal3250,
+                pupilOdGlobal = pm.pupilOdForRoi,
+                pupilOiGlobal = pm.pupilOiForRoi,
+                bridgeYpx = roiSrc.bridgeRowYGlobal3250,
+                probeYpx = roiSrc.bridgeRowYGlobal3250,
+                extraTag = "FACE"
+            ),
+            minIntervalMs = 250L
+        )
+
+        // ============================================================
+        // RimDetector: pasa dirU8 + maskU8 (marker/veto)
+        // ============================================================
+        val detOd0: RimDetectPack3250? = RimDetectorBlock3250.detectRim(
             edgesU8 = edgesOdU8,
             w = wOd,
             h = hOd,
@@ -1122,10 +1278,12 @@ object DnpFacePipeline3250 {
             pupilGlobal = pm.pupilOdForRoi,
             debugTag = "OD",
             pxPerMmGuessFace = roiSrc.pxPerMmGuessFace,
-            seedXpxGlobal3250 = null
+            seedXpxGlobal3250 = null,
+            dirU8 = dirOdU8,
+            maskU8 = maskOdU8
         )
 
-        val detOi = RimDetectorBlock3250.detectRim(
+        val detOi0: RimDetectPack3250? = RimDetectorBlock3250.detectRim(
             edgesU8 = edgesOiU8,
             w = wOi,
             h = hOi,
@@ -1138,19 +1296,56 @@ object DnpFacePipeline3250 {
             pupilGlobal = pm.pupilOiForRoi,
             debugTag = "OI",
             pxPerMmGuessFace = roiSrc.pxPerMmGuessFace,
-            seedXpxGlobal3250 = null
+            seedXpxGlobal3250 = null,
+            dirU8 = dirOiU8,
+            maskU8 = maskOiU8
         )
+
+        val odOk = detOd0?.result?.ok == true
+        val oiOk = detOi0?.result?.ok == true
+
+        val detOdFinal: RimDetectPack3250? = when {
+            odOk -> detOd0
+            oiOk -> RimDetectorBlock3250.mirrorFromOtherEye3250(
+                primary = detOi0.result,
+                targetEdgesU8 = edgesOdU8,
+                w = wOd,
+                h = hOd,
+                targetRoiGlobal = roiOdGlobal,
+                midlineXpx = roiSrc.midXBridgeGlobal3250,
+                debugTag = "OD",
+                srcTag = "OI"
+            )
+
+            else -> null
+        }
+
+        val detOiFinal: RimDetectPack3250? = when {
+            oiOk -> detOi0
+            odOk -> RimDetectorBlock3250.mirrorFromOtherEye3250(
+                primary = detOd0.result,
+                targetEdgesU8 = edgesOiU8,
+                w = wOi,
+                h = hOi,
+                targetRoiGlobal = roiOiGlobal,
+                midlineXpx = roiSrc.midXBridgeGlobal3250,
+                debugTag = "OI",
+                srcTag = "OD"
+            )
+
+            else -> null
+        }
+
+        val rimOd: RimDetectionResult? = detOdFinal?.result
+        val rimOi: RimDetectionResult? = detOiFinal?.result
 
         fun pxFrom(r: RimDetectionResult?): Double? {
             if (r?.ok != true) return null
-            val w = r.innerWidthPx
-            if (!w.isFinite() || w <= 1f) return null
-            val pxmm = w.toDouble() / hboxInnerMm
+            val wPx = r.innerWidthPx
+            if (!wPx.isFinite() || wPx <= 1f) return null
+            val pxmm = wPx.toDouble() / hboxInnerMm
             return pxmm.takeIf { it.isFinite() && it > 1e-6 }
         }
-
-        val rimOd: RimDetectionResult? = detOd?.result
-        val rimOi: RimDetectionResult? = detOi?.result
 
         val odPx = pxFrom(rimOd)
         val oiPx = pxFrom(rimOi)
@@ -1172,13 +1367,11 @@ object DnpFacePipeline3250 {
             }
 
             odPx != null -> {
-                Log.w(TAG, "PX/MM seedFromRim[FACE]: using OD only = $odPx")
-                odPx
+                Log.w(TAG, "PX/MM seedFromRim[FACE]: using OD only = $odPx"); odPx
             }
 
             oiPx != null -> {
-                Log.w(TAG, "PX/MM seedFromRim[FACE]: using OI only = $oiPx")
-                oiPx
+                Log.w(TAG, "PX/MM seedFromRim[FACE]: using OI only = $oiPx"); oiPx
             }
 
             else -> {
@@ -1187,232 +1380,201 @@ object DnpFacePipeline3250 {
                 g
             }
         }
-        val seed = DnpScale3250.pxPerMmSeedFromRimWidth3250(
-            rimOd = rimOd,
-            rimOi = rimOi,
-            hboxInnerMm = hboxInnerMm,
-            pxPerMmGuessFace = roiSrc.pxPerMmGuessFace,
-            tag = "FACE"
-        )
 
-        val pxPerMmOfficial = if (seed.seedPxPerMm.isFinite()) {
-            seed.seedPxPerMm.toDouble()
-        } else {
-            roiSrc.pxPerMmGuessFace.toDouble() // fallback
-        }
-
-// si ya tenías clamp, dejalo igual
-        val pxPerMmOfficialClamped = pxPerMmOfficial.coerceIn(0.5, 30.0)
-
-        Log.d(
-            TAG,
-            "PX/MM seedFromRim[FACE]: od=${seed.pxPerMmOd} oi=${seed.pxPerMmOi} used=${seed.seedPxPerMm} src=${seed.src} -> usedClamped=$pxPerMmOfficialClamped"
-        )
-
-
+        val pxPerMmOfficialClamped = pxPerMmOfficialRaw.coerceIn(0.5, 30.0)
         Log.d(
             TAG,
             "PX/MM used[FACE]=$pxPerMmOfficialClamped (od=$odPx oi=$oiPx guess=${roiSrc.pxPerMmGuessFace})"
         )
 
-        // ✅ Seeds usando EXACTAMENTE el ROI canónico (el recorte)
-        val seedOd = RimArcSeed3250.seedFromPupilOrRoi3250(
-            roiCv = roiOdCvCanon,
-            filHboxMm = hboxInnerMm,
-            filVboxMm = vboxInnerMm,
-            pxPerMmGuess = pxPerMmOfficialClamped.toFloat(),
-            midlineXpxGlobal = roiSrc.midXBridgeGlobal3250,
-            pupilGlobal = pm.pupilOdForRoi,
-            usePupil3250 = false,
-            bridgeRowYpxGlobal = roiSrc.bridgeRowYGlobal3250
-        )
+        // ============================================================
+        // Seeds + ArcFit + Sampler + Debug + Return (tu lógica, consistente)
+        // ============================================================
+        // ============================================================
+// Seeds + ArcFit + Sampler + Debug + Return
+// ============================================================
 
-        val seedOi = RimArcSeed3250.seedFromPupilOrRoi3250(
-            roiCv = roiOiCvCanon,
-            filHboxMm = hboxInnerMm,
-            filVboxMm = vboxInnerMm,
-            pxPerMmGuess = pxPerMmOfficialClamped.toFloat(),
-            midlineXpxGlobal = roiSrc.midXBridgeGlobal3250,
-            pupilGlobal = pm.pupilOiForRoi,
-            usePupil3250 = false,
-            bridgeRowYpxGlobal = roiSrc.bridgeRowYGlobal3250
-        )
+// ✅ seed = del rim (si existe) / fallback pupilOrRoi
+        val seedOd = if (rimOd?.ok == true) {
+            RimArcSeed3250.seedFromRimResult3250(
+                roiCv = roiOdCvCanon,
+                rim = rimOd,
+                filHboxMm = hboxInnerMm,
+                filVboxMm = vboxInnerMm,
+                pxPerMmGuess = pxPerMmOfficialClamped.toFloat(),
+                midlineXpxGlobal = roiSrc.midXBridgeGlobal3250,
+                bridgeRowYpxGlobal = roiSrc.bridgeRowYGlobal3250,
+                eyeSideSign3250 = -1
+            )
+        } else {
+            RimArcSeed3250.seedFromPupilOrRoi3250(
+                roiCv = roiOdCvCanon,
+                filHboxMm = hboxInnerMm,
+                filVboxMm = vboxInnerMm,
+                pxPerMmGuess = pxPerMmOfficialClamped.toFloat(),
+                midlineXpxGlobal = roiSrc.midXBridgeGlobal3250,
+                pupilGlobal = pm.pupilOdForRoi,
+                usePupil3250 = false,
+                bridgeRowYpxGlobal = roiSrc.bridgeRowYGlobal3250
+            )
+        }
+
+        val seedOi = if (rimOi?.ok == true) {
+            RimArcSeed3250.seedFromRimResult3250(
+                roiCv = roiOiCvCanon,
+                rim = rimOi,
+                filHboxMm = hboxInnerMm,
+                filVboxMm = vboxInnerMm,
+                pxPerMmGuess = pxPerMmOfficialClamped.toFloat(),
+                midlineXpxGlobal = roiSrc.midXBridgeGlobal3250,
+                bridgeRowYpxGlobal = roiSrc.bridgeRowYGlobal3250,
+                eyeSideSign3250 = +1
+            )
+        } else {
+            RimArcSeed3250.seedFromPupilOrRoi3250(
+                roiCv = roiOiCvCanon,
+                filHboxMm = hboxInnerMm,
+                filVboxMm = vboxInnerMm,
+                pxPerMmGuess = pxPerMmOfficialClamped.toFloat(),
+                midlineXpxGlobal = roiSrc.midXBridgeGlobal3250,
+                pupilGlobal = pm.pupilOiForRoi,
+                usePupil3250 = false,
+                bridgeRowYpxGlobal = roiSrc.bridgeRowYGlobal3250
+            )
+        }
 
         stage?.onStage(R.string.dnp_stage_arc_fit)
 
-        val midXGlobal = roiSrc.midXBridgeGlobal3250
+        val bottomAnchorOdYpxRoi = bottomAnchorFromRim3250(
+            rim = rimOd, pack = detOdFinal, seed = seedOd,
+            vboxInnerMm = vboxInnerMm, pxPerMmOfficial = pxPerMmOfficialClamped
+        )
 
-        val midOdRoiX = (midXGlobal - odL.toFloat()).coerceIn(0f, (wOd - 1).toFloat())
-        val midOiRoiX = (midXGlobal - oiL.toFloat()).coerceIn(0f, (wOi - 1).toFloat())
+        val bottomAnchorOiYpxRoi = bottomAnchorFromRim3250(
+            rim = rimOi, pack = detOiFinal, seed = seedOi,
+            vboxInnerMm = vboxInnerMm, pxPerMmOfficial = pxPerMmOfficialClamped
+        )
 
-        val bottomAnchorOdYpxRoi = run {
-            val yLocal =
-                rimOd?.takeIf { it.ok }?.bottomYpx?.takeIf { it.isFinite() }
-                    ?.let { it - odT.toFloat() }
-                    ?: (seedOd.originPxRoi.y + 0.40f * (vboxInnerMm * pxPerMmOfficialClamped).toFloat())
-            yLocal.coerceIn(0f, (hOd - 1).toFloat())
-        }
-
-        val bottomAnchorOiYpxRoi = run {
-            val yLocal =
-                rimOi?.takeIf { it.ok }?.bottomYpx?.takeIf { it.isFinite() }
-                    ?.let { it - oiT.toFloat() }
-                    ?: (seedOi.originPxRoi.y + 0.40f * (vboxInnerMm * pxPerMmOfficialClamped).toFloat())
-            yLocal.coerceIn(0f, (hOi - 1).toFloat())
-        }
-
-        val fitArcOd = detOd?.let { pack ->
-            FilPlaceFromArc3250.placeFilByArc3250(
+        val fitArcOd = detOdFinal?.let { pack ->
+            ArcFitAdapter3250.arcFitFromRimPack3250(
                 filPtsMm = filOdMm.ptsMm,
                 filHboxMm = filHboxMm,
                 filVboxMm = filVboxMm,
-                edgesGray = pack.edges, // ✅ ROI-local (wOd*hOd)
-                w = pack.w,
-                h = pack.h,
-                originPxRoi = seedOd.originPxRoi,
-                midlineXpxRoi = midOdRoiX,
-                pxPerMmInitGuess = seedOd.pxPerMmInitGuess,
-                pxPerMmObserved = pxPerMmOfficialClamped,
-                pxPerMmFixed = null,
                 filOverInnerMmPerSide3250 = filOverInnerMmPerSide,
-                excludeDegFrom = 89.0,
-                excludeDegTo = 91.0,
-                stepDeg = 2.0,
-                iters = 2,
-                rSearchRelLo = 0.70,
-                rSearchRelHi = 1.35,
-                bottomAnchorYpxRoi = bottomAnchorOdYpxRoi
+                pack = pack,
+                seed = seedOd,
+                eyeSideSign3250 = -1,
+                pxPerMmObservedOverride = pxPerMmOfficialClamped,
+                bottomAnchorYpxRoiOverride = bottomAnchorOdYpxRoi,
+                iters = 2
             )
         }
 
-        val fitArcOi = detOi?.let { pack ->
-            FilPlaceFromArc3250.placeFilByArc3250(
+        val fitArcOi = detOiFinal?.let { pack ->
+            ArcFitAdapter3250.arcFitFromRimPack3250(
                 filPtsMm = filOiMm.ptsMm,
                 filHboxMm = filHboxMm,
                 filVboxMm = filVboxMm,
-                edgesGray = pack.edges, // ✅ ROI-local
-                w = pack.w,
-                h = pack.h,
-                originPxRoi = seedOi.originPxRoi,
-                midlineXpxRoi = midOiRoiX,
-                pxPerMmInitGuess = seedOi.pxPerMmInitGuess,
-                pxPerMmObserved = pxPerMmOfficialClamped,
-                pxPerMmFixed = null,
                 filOverInnerMmPerSide3250 = filOverInnerMmPerSide,
-                excludeDegFrom = 89.0,
-                excludeDegTo = 91.0,
-                stepDeg = 2.0,
-                iters = 1,
-                rSearchRelLo = 0.70,
-                rSearchRelHi = 1.35,
-                bottomAnchorYpxRoi = bottomAnchorOiYpxRoi
+                pack = pack,
+                seed = seedOi,
+                eyeSideSign3250 = +1,
+                pxPerMmObservedOverride = pxPerMmOfficialClamped,
+                bottomAnchorYpxRoiOverride = bottomAnchorOiYpxRoi,
+                iters = 2 // ✅ simétrico (si querés volver a 1 después)
             )
         }
 
-        // ============================================================
-        // ✅ EDGE + ARC-FIT DEBUG: TODO EN ROI-LOCAL
-        // ============================================================
-        if (saveEdgeArcfitDebugToGallery3250) {
-            detOd?.let { pack ->
-                val r = pack.result
-                fun xLocal(v: Float?): Int? = fToLocalIntOrNull3250(v, odL, pack.w)
-                fun yLocal(v: Float?): Int? = fToLocalIntOrNull3250(v, odT, pack.h)
-
-                val debugUri = EdgeArcfitDebugDump3250.saveEdgeWithArcfitMarksToGallery3250(
-                    ctx = ctx,
-                    eyeTag = "OD",
-                    edgeGray = pack.edges,
-                    w = pack.w,
-                    h = pack.h,
-                    innerLeftPx = xLocal(r.innerLeftXpx),
-                    innerRightPx = xLocal(r.innerRightXpx),
-                    outerNasalPx = null,
-                    outerTemplePx = null,
-                    topPx = yLocal(r.topYpx),
-                    bottomPx = yLocal(r.bottomYpx),
-                    probeYPx = yLocal(r.probeYpx),
-                    placedPxRoi = fitArcOd?.placedPxRoi // 👈 puede ser null, igual guardamos
-                )
-                Log.d(
-                    "EDGE_SAVE3250",
-                    "OD debugUri=$debugUri placed=${fitArcOd?.placedPxRoi?.size ?: 0}"
-                )
-            }
-
-            detOi?.let { pack ->
-                val r = pack.result
-                fun xLocal(v: Float?): Int? = fToLocalIntOrNull3250(v, oiL, pack.w)
-                fun yLocal(v: Float?): Int? = fToLocalIntOrNull3250(v, oiT, pack.h)
-
-                val debugUri = EdgeArcfitDebugDump3250.saveEdgeWithArcfitMarksToGallery3250(
-                    ctx = ctx,
-                    eyeTag = "OI",
-                    edgeGray = pack.edges,
-                    w = pack.w,
-                    h = pack.h,
-                    innerLeftPx = xLocal(r.innerLeftXpx),
-                    innerRightPx = xLocal(r.innerRightXpx),
-                    outerNasalPx = null,
-                    outerTemplePx = null,
-                    topPx = yLocal(r.topYpx),
-                    bottomPx = yLocal(r.bottomYpx),
-                    probeYPx = yLocal(r.probeYpx),
-                    placedPxRoi = fitArcOi?.placedPxRoi
-                )
-                Log.d(
-                    "EDGE_SAVE3250",
-                    "OI debugUri=$debugUri placed=${fitArcOi?.placedPxRoi?.size ?: 0}"
-                )
-            }
+        val pxArcOd = fitArcOd?.let {
+            ArcFitAdapter3250.pxMmFromFit3250(
+                fit = it,
+                filHboxMm = filHboxMm,
+                filVboxMm = filVboxMm,
+                filOverInnerMmPerSide3250 = filOverInnerMmPerSide,
+                tolRelXY = 0.10
+            )
         }
 
-        // ✅ placed ROI-local -> GLOBAL usando ROI canónico (sumar odL/odT / oiL/oiT)
-        val placedOdGlobal0 = run {
-            val pts = fitArcOd?.placedPxRoi
-            if (pts.isNullOrEmpty()) null
-            else pts.map { p -> PointF(p.x + odL, p.y + odT) }
+        val pxArcOi = fitArcOi?.let {
+            ArcFitAdapter3250.pxMmFromFit3250(
+                fit = it,
+                filHboxMm = filHboxMm,
+                filVboxMm = filVboxMm,
+                filOverInnerMmPerSide3250 = filOverInnerMmPerSide,
+                tolRelXY = 0.10
+            )
         }
-        val placedOiGlobal0 = run {
-            val pts = fitArcOi?.placedPxRoi
-            if (pts.isNullOrEmpty()) null
-            else pts.map { p -> PointF(p.x + oiL, p.y + oiT) }
+
+// ✅ placed GLOBAL (te faltaba OD)
+        val placedOdGlobal0 = if (fitArcOd?.placedPxRoi?.isNotEmpty() == true) {
+            roiLocalToGlobal3250(fitArcOd.placedPxRoi, detOdFinal.result.roiPx)
+        } else null
+
+        val placedOiGlobal0 = if (fitArcOi?.placedPxRoi?.isNotEmpty() == true) {
+            roiLocalToGlobal3250(fitArcOi.placedPxRoi, detOiFinal.result.roiPx)
+        } else null
+
+// ✅ px/mm oficial “desde Arc” (validando también OI + chequeo VBOX)
+        val pxPerMmOfficialFromArc = run {
+            fun okArc(p: Any?): Double? {
+                val pp = p as? ArcFitAdapter3250.PxMmPack3250 ?: return null // usa tu tipo real
+                if (pp.relErrXY > 0.10) return null
+                val expSpanY = vboxInnerMm * pp.pxPerMmX
+                val errV = abs(pp.spanYpxModel - expSpanY) / expSpanY.coerceAtLeast(1e-6)
+                if (errV > 0.15) return null
+                return pp.pxPerMmOfficial
+            }
+
+            val odOk = okArc(pxArcOd)
+            val oiOk = okArc(pxArcOi)
+
+            when {
+                odOk != null && oiOk != null -> {
+                    val avg = 0.5 * (odOk + oiOk)
+                    val rel = abs(odOk - oiOk) / avg.coerceAtLeast(1e-6)
+                    if (rel <= 0.12) avg else {
+                        // si divergen, elegimos el más cercano al oficial por ancho (rim)
+                        val base = pxPerMmOfficialClamped
+                        if (abs(odOk - base) <= abs(oiOk - base)) odOk else oiOk
+                    }
+                }
+                odOk != null -> odOk
+                oiOk != null -> oiOk
+                else -> pxPerMmOfficialClamped
+            }
         }
 
         val pupilYGlobalUsed = roiSrc.bridgeRowYGlobal3250
 
         stage?.onStage(R.string.dnp_stage_sampler)
 
-        val odRef = placedOdGlobal0?.let { pts ->
+        val odRef = if (placedOdGlobal0 != null && detOdFinal != null) {
             RimRenderSampler3250.refinePlacedBySampling3250(
                 stillBmp = stillBmp,
-                roiGlobal = roiOdGlobal,
-                placedPtsGlobal = pts,
+                roiGlobal = detOdFinal.result.roiPx,
+                placedPtsGlobal = placedOdGlobal0,
                 pupilYGlobal = pupilYGlobalUsed,
                 useBottomOnly = true
             )
-        }
-        val oiRef = placedOiGlobal0?.let { pts ->
+        } else null
+
+        val oiRef = if (placedOiGlobal0 != null && detOiFinal != null) {
             RimRenderSampler3250.refinePlacedBySampling3250(
                 stillBmp = stillBmp,
-                roiGlobal = roiOiGlobal,
-                placedPtsGlobal = pts,
+                roiGlobal = detOiFinal.result.roiPx,
+                placedPtsGlobal = placedOiGlobal0,
                 pupilYGlobal = pupilYGlobalUsed,
                 useBottomOnly = true
             )
-        }
+        } else null
 
-        val placedOdUsed = odRef?.best?.takeIf { it.score >= 0.25f }?.transformedPtsGlobal ?: placedOdGlobal0
-        val placedOiUsed = oiRef?.best?.takeIf { it.score >= 0.25f }?.transformedPtsGlobal ?: placedOiGlobal0
+        val placedOdUsed =
+            odRef?.best?.takeIf { it.score >= 0.25f }?.transformedPtsGlobal ?: placedOdGlobal0
+        val placedOiUsed =
+            oiRef?.best?.takeIf { it.score >= 0.25f }?.transformedPtsGlobal ?: placedOiGlobal0
 
-        // dumps del detector
-        detOd?.let { pack ->
-            DebugDump3250.dumpEdgesOnly(ctx, pack, "OD")
-            DebugDump3250.dumpRim(ctx, rimSrcBmp, pack, "OD")
-        }
-        detOi?.let { pack ->
-            DebugDump3250.dumpEdgesOnly(ctx, pack, "OI")
-            DebugDump3250.dumpRim(ctx, rimSrcBmp, pack, "OI")
-        }
+        detOd0?.let { DebugDump3250.dumpRim(context = ctx, pack = it, debugTag = "OD_RAW") }
+        detOi0?.let { DebugDump3250.dumpRim(context = ctx, pack = it, debugTag = "OI_RAW") }
 
         stage?.onStage(R.string.dnp_stage_debug)
 
@@ -1423,22 +1585,24 @@ object DnpFacePipeline3250 {
             placedOdUsed = placedOdUsed,
             placedOiUsed = placedOiUsed
         )
+
         val dbgUri = saveDebugBitmapToCache3250(
             ctx = ctx,
             fileName = "DBG_FACE_${System.currentTimeMillis()}.png",
             bmp = dbgBmp,
-            alsoCopyToGallery3250 = saveEdgeArcfitDebugToGallery3250, // tu switch
-            galleryRelativePath3250 = "Pictures/PrecalDNP/DEBUG"
+            alsoCopyToGallery3250 = saveEdgeArcfitDebugToGallery3250
         )
 
-
-        try { dbgBmp.recycle() } catch (_: Throwable) {}
+        try {
+            dbgBmp.recycle()
+        } catch (_: Throwable) {
+        }
 
         val dbgUriStr = dbgUri?.toString()
         Log.d(TAG, "DBG_URI_3250=$dbgUriStr")
 
         return FitPack3250(
-            pxPerMmFaceD = pxPerMmOfficialClamped,
+            pxPerMmFaceD = pxPerMmOfficialFromArc,
             placedOdUsed = placedOdUsed,
             placedOiUsed = placedOiUsed,
             rimOd = rimOd,
@@ -1514,8 +1678,7 @@ object DnpFacePipeline3250 {
         ctx: Context,
         fileName: String,
         bmp: Bitmap,
-        alsoCopyToGallery3250: Boolean = false,
-        galleryRelativePath3250: String = "Pictures/PrecalDNP/DEBUG"
+        alsoCopyToGallery3250: Boolean = false
     ): Uri? {
 
         val dbgUri: Uri? = try {
@@ -1534,8 +1697,7 @@ object DnpFacePipeline3250 {
             val g = copyUriToGallery3250(
                 ctx = ctx,
                 srcUri = dbgUri,
-                displayName = fileName,
-                relativePath = galleryRelativePath3250
+                displayName = fileName
             )
             Log.d(TAG, "DBG_FACE copied to gallery: $g")
         }
@@ -1546,33 +1708,158 @@ object DnpFacePipeline3250 {
     private fun copyUriToGallery3250(
         ctx: Context,
         srcUri: Uri,
-        displayName: String,
-        relativePath: String
-    )
-    {
-    }
+        displayName: String
+    ): Uri? {
+        return try {
+            val resolver = ctx.contentResolver
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
+                put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/PrecalDNP")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
 
+            val dstUri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return null
+
+            resolver.openInputStream(srcUri).use { ins ->
+                resolver.openOutputStream(dstUri).use { outs ->
+                    if (ins == null || outs == null) return null
+                    ins.copyTo(outs)
+                }
+            }
+
+            val done = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
+            resolver.update(dstUri, done, null, null)
+
+            dstUri
+        } catch (t: Throwable) {
+            Log.e(TAG, "copyUriToGallery3250 error", t)
+            null
+        }
+    }
     fun metricsToMeasurementResult3250(
         m: DnpMetrics3250,
         originalUriStr: String,
-        dbgUriStr: String?
+        dbgUriStr: String? = null,
+
+        // ✅ NUEVO: imagen FINAL (ROI + overlays “bonitos”). Si no la pasás, cae a dbg.
+        finalAnnotatedUriStr: String? = null,
+
+        // ✅ medidas del aro (si las tenés de ShapeTraceResult)
+        anchoMm: Double = Double.NaN,
+        altoMm: Double = Double.NaN,
+        diagMayorMm: Double = Double.NaN,
+
+        // ✅ métricas del FIL (si las tenés)
+        filHboxMm: Double = Double.NaN,
+        filVboxMm: Double = Double.NaN,
+        filDblMm: Double = Double.NaN,
+        filEyeSizeMm: Double = Double.NaN,
+        filCircMm: Double = Double.NaN,
+
+        // ✅ stats arcfit (opcional)
+        arcFitRotDeg: Double = Double.NaN,
+        arcFitRmsPx: Double = Double.NaN,
+        arcFitUsedSamples: Int = 0
     ): MeasurementResult {
 
-        fun d(x: Double) = if (x.isFinite()) x else Double.NaN
+        fun dd(x: Double): Double = if (x.isFinite()) x else Double.NaN
+
+        val annotated = (finalAnnotatedUriStr?.takeIf { it.isNotBlank() }
+            ?: dbgUriStr?.takeIf { it.isNotBlank() }
+            ?: "")
 
         return MeasurementResult(
-            anchoMm = Double.NaN,
-            altoMm = Double.NaN,
-            diagMayorMm = Double.NaN,
-            puenteMm = d(m.bridgeMm),
-            dnpOdMm = d(m.dnpOdMm),
-            dnpOiMm = d(m.dnpOiMm),
-            altOdMm = d(m.heightOdMm),
-            altOiMm = d(m.heightOiMm),
-            diamUtilOdMm = d(m.diamUtilOdMm),
-            diamUtilOiMm = d(m.diamUtilOiMm),
-            annotatedPath = dbgUriStr ?: "",
-            originalPath = originalUriStr
+            annotatedPath = annotated,
+            originalPath = originalUriStr,
+
+            // A/B/Diag del aro (ShapeTrace)
+            anchoMm = dd(anchoMm),
+            altoMm = dd(altoMm),
+            diagMayorMm = dd(diagMayorMm),
+
+            // Ø útil
+            diamUtilOdMm = dd(m.diamUtilOdMm),
+            diamUtilOiMm = dd(m.diamUtilOiMm),
+
+            // DNP
+            dnpOdMm = dd(m.dnpOdMm),
+            dnpOiMm = dd(m.dnpOiMm),
+
+            // alturas
+            altOdMm = dd(m.heightOdMm),
+            altOiMm = dd(m.heightOiMm),
+
+            // puente (UNA sola vez, no duplicado)
+            puenteMm = dd(m.bridgeMm),
+
+            // 3250 extras
+            pxPerMmFace3250 = dd(m.pxPerMmFaceD),
+
+            filHboxMm3250 = dd(filHboxMm),
+            filVboxMm3250 = dd(filVboxMm),
+            filDblMm3250 = dd(filDblMm),
+            filEyeSizeMm3250 = dd(filEyeSizeMm),
+            filCircMm3250 = dd(filCircMm),
+
+            arcFitRotDeg3250 = dd(arcFitRotDeg),
+            arcFitRmsPx3250 = dd(arcFitRmsPx),
+            arcFitUsedSamples3250 = arcFitUsedSamples
         )
     }
+
+    private fun roiLocalToGlobal3250(ptsRoi: List<PointF>, roiPx: RectF): List<PointF> {
+        val l = roiPx.left
+        val t = roiPx.top
+        return ptsRoi.map { p -> PointF(p.x + l, p.y + t) }
+    }
+
+    private fun bottomAnchorFromRim3250(
+        rim: RimDetectionResult?,
+        pack: RimDetectPack3250?,
+        seed: RimArcSeed3250.ArcSeed3250,
+        vboxInnerMm: Double,
+        pxPerMmOfficial: Double
+    ): Float {
+        val h = (pack?.h ?: 0).coerceAtLeast(2)
+        val fallback = seed.originPxRoi.y + 0.40f * (vboxInnerMm * pxPerMmOfficial).toFloat()
+
+        val yLocal = if (rim?.ok == true && rim.bottomYpx.isFinite()) {
+            // ✅ GLOBAL -> ROI-local usando el roiPx del RESULT (no odT/oiT)
+            (rim.bottomYpx - rim.roiPx.top)
+        } else fallback
+
+        return yLocal.coerceIn(0f, (h - 1).toFloat())
+    }
+    private fun fToLocalIntOrNull3250(vGlobal: Float?, x0: Int, limit: Int): Int? {
+        val v = vGlobal ?: return null
+        if (!v.isFinite()) return null
+        if (limit <= 0) return null
+
+        val local = (v - x0.toFloat()).roundToInt()
+        return if (local in 0 until limit) local else null   // ✅ NO clamp: si está afuera, es null
+    }
+    private data class RoiU8(val u8: ByteArray, val w: Int, val h: Int, val roiGlobal: RectF)
+
+    private fun cropRoiU8(full: ByteArray, wFull: Int, hFull: Int, roiG: RectF): RoiU8? {
+        var l = roiG.left.roundToInt().coerceIn(0, wFull - 1)
+        var t = roiG.top.roundToInt().coerceIn(0, hFull - 1)
+        var r = roiG.right.roundToInt().coerceIn(0, wFull)
+        var b = roiG.bottom.roundToInt().coerceIn(0, hFull)
+
+        if (r <= l || b <= t) return null
+
+        val w = (r - l).coerceAtLeast(1)
+        val h = (b - t).coerceAtLeast(1)
+        val out = ByteArray(w * h)
+
+        var dst = 0
+        for (y in 0 until h) {
+            val srcRow = (t + y) * wFull + l
+            full.copyInto(out, dst, srcRow, srcRow + w)
+            dst += w
+        }
+        return RoiU8(out, w, h, RectF(l.toFloat(), t.toFloat(), r.toFloat(), b.toFloat()))
+    }
+
 }

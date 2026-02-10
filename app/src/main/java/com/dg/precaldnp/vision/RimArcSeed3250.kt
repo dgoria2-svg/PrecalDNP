@@ -1,26 +1,23 @@
-// app/src/main/java/com/dg/precaldnp/vision/RimArcSeed3250.kt
 package com.dg.precaldnp.vision
 
 import android.graphics.PointF
 import org.opencv.core.Rect
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.sign
 
 object RimArcSeed3250 {
 
     data class ArcSeed3250(
-        val originPxRoi: PointF,      // SIEMPRE ROI-local (x: 0..w-1, y: 0..h-1)
+        val originPxRoi: PointF,      // ROI-local (x: 0..w-1, y: 0..h-1)
         val pxPerMmInitGuess: Double,
         val src3250: String
     )
 
+    private fun clamp(v: Float, lo: Float, hi: Float): Float = max(lo, min(hi, v))
+
     /**
-     * Seed “oficial” para ARC-FIT (3250):
-     * - Por defecto NO usa pupila.
-     * - Planta el origen cerca del “centro esperado” a partir de HBOX/VBOX y pxPerMmGuess.
-     *
-     * OJO: midlineXpxGlobal está en coords GLOBAL (STILL). NO pasar midline ROI acá.
+     * Fallback: seed desde pupil o centro del ROI (tu API actual).
+     * Usa VBOX para poner un Y razonable (center-ish) en vez de quedarte pegado a bridge/pupila.
      */
     fun seedFromPupilOrRoi3250(
         roiCv: Rect,
@@ -29,73 +26,102 @@ object RimArcSeed3250 {
         pxPerMmGuess: Float,
         midlineXpxGlobal: Float,
         pupilGlobal: PointF?,
-        usePupil3250: Boolean = false,
-        bridgeRowYpxGlobal: Float? = null
+        usePupil3250: Boolean,
+        bridgeRowYpxGlobal: Float
     ): ArcSeed3250 {
 
-        val roiW = roiCv.width
-        val roiH = roiCv.height
-        if (roiW <= 1 || roiH <= 1) {
-            return ArcSeed3250(
-                originPxRoi = PointF(0f, 0f),
-                pxPerMmInitGuess = 5.0,
-                src3250 = "roi_invalid"
-            )
-        }
+        val w = roiCv.width.coerceAtLeast(2)
+        val h = roiCv.height.coerceAtLeast(2)
+        val l = roiCv.x.toFloat()
+        val t = roiCv.y.toFloat()
 
-        val pxGuess = pxPerMmGuess.toDouble()
-            .takeIf { it.isFinite() && it > 1e-6 }
-            ?.coerceIn(2.5, 20.0)
-            ?: 5.0
+        val pxmm = pxPerMmGuess.toDouble().takeIf { it.isFinite() && it > 1e-6 } ?: 5.0
+        val expHpx = (filVboxMm * pxmm).toFloat()
 
-        val expWpx = (filHboxMm * pxGuess).toFloat().coerceAtLeast(60f)
-        val expHpx = (filVboxMm * pxGuess).toFloat().coerceAtLeast(60f)
-
-        // Lado del ROI respecto a la midline GLOBAL (STILL)
-        val roiCenterXg = roiCv.x + roiCv.width * 0.5f
-        val s = sign(roiCenterXg - midlineXpxGlobal)
-        val sideSign = if (s == 0f) 1f else s  // +1: a la derecha de la midline, -1: a la izquierda
-
-        val pupilAllowed = usePupil3250 && (pupilGlobal != null)
-
-        val src: String
-        val originXg: Float
-        val originYg: Float
-
-        if (pupilAllowed) {
-            // (Hoy NO lo querés, pero lo dejamos disponible)
-            src = "pupil"
-            val offX = (0.25f * expWpx).coerceIn(20f, 0.45f * expWpx)
-            originXg = pupilGlobal!!.x + sideSign * offX
-            originYg = pupilGlobal.y + 0.10f * expHpx
+        val xG = if (usePupil3250 && pupilGlobal != null && pupilGlobal.x.isFinite()) {
+            pupilGlobal.x
         } else {
-            // Opción oficial: seed esperado del FIL (NO depende de pupila)
-            src = "expected"
-
-            // separación desde midline hasta el interior del aro (gap) + medio ancho esperado
-            val gapPx = max(18f, 0.10f * expWpx)
-            originXg = midlineXpxGlobal + sideSign * (gapPx + 0.50f * expWpx)
-
-            // yRef = bridgeRow (preferido) o centro del ROI
-            val yRef = bridgeRowYpxGlobal ?: (roiCv.y + 0.52f * roiCv.height)
-            originYg = yRef + 0.10f * expHpx
+            l + 0.5f * w
         }
 
-        // Clamp GLOBAL dentro del ROI GLOBAL
-        val xg = clamp(originXg, roiCv.x.toFloat(), (roiCv.x + roiCv.width - 1).toFloat())
-        val yg = clamp(originYg, roiCv.y.toFloat(), (roiCv.y + roiCv.height - 1).toFloat())
+        // Pupil/bridge está “alto” vs caja; empujamos hacia el centro usando VBOX (no inventamos top/bottom).
+        val yRef = bridgeRowYpxGlobal.takeIf { it.isFinite() } ?: (t + 0.5f * h)
+        val yG = (yRef + 0.10f * expHpx) // ~centro desde bridge
 
-        // Pasar a coords ROI-local
-        val xRoi = clamp(xg - roiCv.x.toFloat(), 0f, (roiCv.width - 1).toFloat())
-        val yRoi = clamp(yg - roiCv.y.toFloat(), 0f, (roiCv.height - 1).toFloat())
+        val xL = clamp(xG - l, 0f, (w - 1).toFloat())
+        val yL = clamp(yG - t, 0f, (h - 1).toFloat())
 
         return ArcSeed3250(
-            originPxRoi = PointF(xRoi, yRoi),
-            pxPerMmInitGuess = pxGuess,
-            src3250 = src
+            originPxRoi = PointF(xL, yL),
+            pxPerMmInitGuess = pxmm,
+            src3250 = if (usePupil3250) "pupilOrRoi_pupil" else "pupilOrRoi_roi"
         )
     }
 
-    private fun clamp(v: Float, lo: Float, hi: Float): Float =
-        max(lo, min(hi, v))
+    /**
+     * ✅ Seed REAL: sale del RimDetectionResult (inner L/R + bottom).
+     * - px/mm init sale de innerWidthPx/HBOX_inner_mm si está.
+     * - originX = centro de inner (o fallback guiado por midline + eyeSideSign).
+     * - originY = bottom - 0.52*VBOXpx (centro vertical aproximado, consistente con “ancla bottom”).
+     */
+    fun seedFromRimResult3250(
+        roiCv: Rect,
+        rim: RimDetectionResult,
+        filHboxMm: Double,
+        filVboxMm: Double,
+        pxPerMmGuess: Float,
+        midlineXpxGlobal: Float,
+        bridgeRowYpxGlobal: Float,
+        eyeSideSign3250: Int // OD=-1, OI=+1 (nasal hacia midline)
+    ): ArcSeed3250 {
+
+        val w = roiCv.width.coerceAtLeast(2)
+        val h = roiCv.height.coerceAtLeast(2)
+        val l = roiCv.x.toFloat()
+        val t = roiCv.y.toFloat()
+
+        val pxmmGuess = pxPerMmGuess.toDouble().takeIf { it.isFinite() && it > 1e-6 } ?: 5.0
+
+        val pxmmFromW = run {
+            val wPx = rim.innerWidthPx
+            if (rim.ok && wPx.isFinite() && wPx > 1f && filHboxMm.isFinite() && filHboxMm > 1.0) {
+                (wPx.toDouble() / filHboxMm).takeIf { it.isFinite() && it > 1e-6 }
+            } else null
+        }
+
+        val pxmm = pxmmFromW ?: pxmmGuess
+        val expWpx = (filHboxMm * pxmm).toFloat()
+        val expHpx = (filVboxMm * pxmm).toFloat()
+
+        val cxG = run {
+            val xL = rim.innerLeftXpx
+            val xR = rim.innerRightXpx
+            if (rim.ok && xL.isFinite() && xR.isFinite() && xR > xL) {
+                0.5f * (xL + xR)
+            } else {
+                // fallback guiado por midline: el centro del ojo está “del lado opuesto” al nasal.
+                val side = (-eyeSideSign3250).toFloat() // OD => +1 (a la derecha), OI => -1 (a la izquierda)
+                (midlineXpxGlobal + side * 0.33f * expWpx)
+            }
+        }
+
+        val cyG = run {
+            val bot = rim.bottomYpx
+            if (rim.ok && bot.isFinite()) {
+                (bot - 0.52f * expHpx)
+            } else {
+                val yRef = bridgeRowYpxGlobal.takeIf { it.isFinite() } ?: (t + 0.5f * h)
+                (yRef + 0.10f * expHpx)
+            }
+        }
+
+        val xL = clamp(cxG - l, 0f, (w - 1).toFloat())
+        val yL = clamp(cyG - t, 0f, (h - 1).toFloat())
+
+        return ArcSeed3250(
+            originPxRoi = PointF(xL, yL),
+            pxPerMmInitGuess = pxmm,
+            src3250 = if (pxmmFromW != null) "rimResult_wSeed" else "rimResult_guessSeed"
+        )
+    }
 }
