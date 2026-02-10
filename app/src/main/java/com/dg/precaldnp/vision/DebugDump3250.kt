@@ -17,11 +17,13 @@ import android.util.Log
 import java.io.OutputStream
 import kotlin.math.max
 import kotlin.math.min
-
+object DebugPaths3250 {
+    const val REL_PATH = "Pictures/PrecalDNP/DEBUG" // UNA sola carpeta
+}
 object DebugDump3250 {
 
     private const val TAG = "DebugDump3250"
-    private const val REL_PATH = "Pictures/PrecalDNP/DEBUG"
+    private const val REL_PATH = DebugPaths3250.REL_PATH
 
     // throttle por "canal" (OD_EDGES, OI_EDGES, OD_ROI, etc.)
     private val lastByKey = HashMap<String, Long>()
