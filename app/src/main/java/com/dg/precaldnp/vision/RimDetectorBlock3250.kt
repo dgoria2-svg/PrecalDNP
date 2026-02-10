@@ -965,4 +965,6 @@ object RimDetectorBlock3250 {
         val hi = max(a, b)
         return v.coerceIn(lo, hi)
     }
+    private inline fun u8(b: Byte): Int = b.toInt() and 0xFF
+
 }

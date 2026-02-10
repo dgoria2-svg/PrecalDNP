@@ -157,7 +157,8 @@ object EdgeArcfitDebugDump3250 {
             ctx = ctx,
             bmp = bmp,
             displayName = displayName,
-            relativePath = "Pictures/PrecalDNP/DEBUG3250"
+            relativePath = DebugPaths3250.REL_PATH
+
         )
 
         try { bmp.recycle() } catch (_: Throwable) {}

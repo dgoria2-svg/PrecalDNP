@@ -20,6 +20,7 @@ import com.dg.precaldnp.model.ShapeTraceResult
 import com.dg.precaldnp.model.WorkEye3250
 import com.dg.precaldnp.vision.DebugDump3250
 import com.dg.precaldnp.vision.EdgeArcfitDebugDump3250
+import com.dg.precaldnp.vision.EdgeMapBuilder3250
 import com.dg.precaldnp.vision.FilContourBuilder3250
 import com.dg.precaldnp.vision.FilPlaceFromArc3250
 import com.dg.precaldnp.vision.IrisDnpLandmarker3250
@@ -39,6 +40,7 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+
 
 object DnpFacePipeline3250 {
 
@@ -137,6 +139,8 @@ object DnpFacePipeline3250 {
     )
 
     // ============================================================
+    // ✅ ÚNICO CONTRATO: FULL edges U8 (0/255) desde STILL, una sola vez.
+    // ============================================================
 
     fun measureArcFitOnlyCore3250(
         ctx: Context,
@@ -150,17 +154,53 @@ object DnpFacePipeline3250 {
         irisEngine: IrisDnpLandmarker3250?,
         pupilEngine: PupilFrameEngine3250,
         filOverInnerMmPerSide: Double,
-        edgeMapFullBmp3250: Bitmap? = null, // ✅ ahora no rompe el call-site
+        edgeMapFullU8_3250: ByteArray? = null, // ✅ inyección opcional (debug); si null se construye.
         saveRingRoiDebug: Boolean = false,
         saveEdgeArcfitDebugToGallery3250: Boolean = false,
         stage: StageCb3250? = null
-    ): MeasureOut3250 {
+    ): MeasureOut3250? {
 
         val stillBmp = loadBitmapOriented(ctx, savedUri) ?: error("No se pudo leer la foto.")
 
+        // 1) Landmarks primero (para topKill/mask)
         val iris = estimateIrisPack3250(ctx, stillBmp, irisEngine)
+
+        // 2) Boxes (para máscara simple de ojos/cejas)
         val boxes = resolveBoxesStill3250(stillBmp, sp, filHboxMm, filVboxMm)
 
+        // 3) topKillY + maskFull (si no hay iris => 0 y null)
+        val topKillY3250 = computeTopKillYFromIris3250(iris, stillBmp.height)
+        val maskFull3250 = buildMaskFullEyesAndBrows3250(
+            w = stillBmp.width,
+            h = stillBmp.height,
+            iris = iris,
+            boxes = boxes
+        )
+
+        // 4) ✅ FULL edge map U8 (0/255): UNA sola vez por foto
+        val w = stillBmp.width
+        val h = stillBmp.height
+
+        val nFullL = w.toLong() * h.toLong()
+        if (nFullL <= 0L || nFullL > Int.MAX_VALUE.toLong()) {
+            Log.e("EDGE3250", "nFull overflow/invalid: w=$w h=$h n=$nFullL")
+            // abortar o bajar resolución del still antes de edge
+        }
+        val nFull = nFullL.toInt()
+
+        val edgeFullU8: ByteArray =
+            edgeMapFullU8_3250?.takeIf { it.size == nFull }
+                ?: EdgeMapBuilder3250.buildFullFrameEdgeMapFromBitmap3250(
+                    stillBmp = stillBmp,
+                    borderKillPx = 4,
+                    topKillY = 0,
+                    maskFull = null,
+                    debugTag = "FACE",
+                    ctx = ctx,
+                    debugSaveToGallery3250 = true
+                )
+
+        // 5) Pupilas + midline (solo landmarks/cascade; NO OpenCV midline)
         val pm = resolvePupilsAndMidline3250(
             stillBmp = stillBmp,
             iris = iris,
@@ -169,6 +209,7 @@ object DnpFacePipeline3250 {
             isMirrored3250 = sp.isMirrored3250
         )
 
+        // 6) ROI packs (global)
         val roiSrc = buildRoiAndRimSource3250(
             ctx = ctx,
             stillBmp = stillBmp,
@@ -180,6 +221,7 @@ object DnpFacePipeline3250 {
             saveRingRoiDebug = saveRingRoiDebug
         )
 
+        // 7) RimDetector + ArcFit consumen SOLO edgeFullU8
         val fit = detectFitAndRefine3250(
             ctx = ctx,
             stillBmp = stillBmp,
@@ -192,7 +234,7 @@ object DnpFacePipeline3250 {
             filOdMm = filOdMm,
             filOiMm = filOiMm,
             filOverInnerMmPerSide = filOverInnerMmPerSide,
-            edgeMapFullBmp3250 = edgeMapFullBmp3250,
+            edgeMapFullU8_3250 = edgeFullU8,
             saveEdgeArcfitDebugToGallery3250 = saveEdgeArcfitDebugToGallery3250,
             stage = stage
         )
@@ -269,14 +311,14 @@ object DnpFacePipeline3250 {
             rightBoxReal3250 = true,
             midlineXPreview3250 = midX,
             midlineEstimated3250 = true,
-            pxPerMmFace3250 = pxPerMm,
+            pxPerMmFace3250 = pxPerMm, // ✅ ya no gris
             rotationDegPreview3250 = rotationDeg,
             isMirrored3250 = false,
             workEye3250 = WorkEye3250.RIGHT_OD
         )
-    }
+}
 
-    // ============================================================
+        // ============================================================
 
     private fun isPngBytes3250(bytes: ByteArray): Boolean {
         if (bytes.size < 8) return false
@@ -676,6 +718,92 @@ object DnpFacePipeline3250 {
     }
 
     // ============================================================
+    // ✅ FULL edge map: topKill + mask helpers (para que compile y sea consistente)
+    // ============================================================
+
+    private fun computeTopKillYFromIris3250(iris: IrisPack3250, h: Int): Int {
+        if (!iris.ok) return 0
+        val y1 = iris.browLeftBottomYpx?.takeIf { it.isFinite() }
+        val y2 = iris.browRightBottomYpx?.takeIf { it.isFinite() }
+        val yMin = when {
+            y1 != null && y2 != null -> min(y1, y2)
+            y1 != null -> y1
+            y2 != null -> y2
+            else -> null
+        } ?: return 0
+
+        // Kill global opcional (suave). Si querés desactivarlo: retorná 0.
+        val pad = 18f
+        return (yMin - pad).roundToInt().coerceIn(0, h.coerceAtLeast(1) - 1)
+    }
+
+    /**
+     * Máscara simple (U8): marca zonas de ojos/cejas para que EdgeMapBuilder haga flattening (anti-halo)
+     * y no compute edges adentro.
+     *
+     * Si no hay iris/brows => null (queda sin máscara).
+     */
+    private fun buildMaskFullEyesAndBrows3250(
+        w: Int,
+        h: Int,
+        iris: IrisPack3250,
+        boxes: BoxesPack3250
+    ): ByteArray? {
+        if (!iris.ok) return null
+
+        val browL = iris.browLeftBottomYpx?.takeIf { it.isFinite() }
+        val browR = iris.browRightBottomYpx?.takeIf { it.isFinite() }
+        if (browL == null && browR == null) return null
+
+        val mask = ByteArray(w * h)
+
+        fun fillRect(r: RectF) {
+            val l = r.left.roundToInt().coerceIn(0, w - 1)
+            val t = r.top.roundToInt().coerceIn(0, h - 1)
+            val rr = r.right.roundToInt().coerceIn(l + 1, w)
+            val bb = r.bottom.roundToInt().coerceIn(t + 1, h)
+            for (yy in t until bb) {
+                val off = yy * w
+                for (xx in l until rr) {
+                    mask[off + xx] = 1
+                }
+            }
+        }
+
+        fun eyeMaskFromBox(box: RectF, browBottomY: Float?) {
+            val bb = browBottomY?.takeIf { it.isFinite() } ?: return
+            val bw = box.width().coerceAtLeast(1f)
+            val bh = box.height().coerceAtLeast(1f)
+
+            val padX = (0.14f * bw).coerceIn(18f, 60f)
+            val padY = (0.16f * bh).coerceIn(16f, 70f)
+
+            // zona superior del box (ceja + párpado) hasta un poco debajo del browBottom
+            val top = (box.top - padY).coerceIn(0f, (h - 1).toFloat())
+            val bottom = (bb + 0.35f * bh).coerceIn(top + 2f, (h - 1).toFloat())
+
+            val r = RectF(
+                (box.left - padX).coerceIn(0f, (w - 1).toFloat()),
+                top,
+                (box.right + padX).coerceIn(0f, (w - 1).toFloat()),
+                bottom
+            )
+            fillRect(r)
+        }
+
+        // OJO: browLeft/browRight están en coords STILL, pero “left/right” de iris no siempre coincide con OD/OI.
+        // Acá solo hacemos una máscara útil; la asignación fina OD/OI la hace tu pipeline más abajo.
+        // Usamos ambos browBottom para ambos boxes (robusto).
+        val bbAny = listOfNotNull(browL, browR).minOrNull()
+        val bbAny2 = listOfNotNull(browL, browR).maxOrNull()
+
+        eyeMaskFromBox(boxes.boxOdF, bbAny)
+        eyeMaskFromBox(boxes.boxOiF, bbAny2 ?: bbAny)
+
+        return mask
+    }
+
+    // ============================================================
 
     private fun roiFromMidline40603250(
         mid: Midline3250,
@@ -903,47 +1031,21 @@ object DnpFacePipeline3250 {
         filOdMm: FilContourBuilder3250.ContourMm3250,
         filOiMm: FilContourBuilder3250.ContourMm3250,
         filOverInnerMmPerSide: Double,
-        edgeMapFullBmp3250: Bitmap?=null,                 // ✅ ÚNICA fuente de edges
+        edgeMapFullU8_3250: ByteArray?,                 // ✅ ÚNICA fuente de edges (FULL)
         saveEdgeArcfitDebugToGallery3250: Boolean = false,
         stage: StageCb3250? = null
     ): FitPack3250 {
-
-        if (edgeMapFullBmp3250 == null) {
-            Log.e(TAG, "EDGE_FULL missing (edgeMapFullBmp3250=null). Abort arcfit.")
-            return FitPack3250(
-                pxPerMmFaceD = roiSrc.pxPerMmGuessFace.toDouble(),
-                placedOdUsed = null,
-                placedOiUsed = null,
-                rimOd = null,
-                rimOi = null,
-                dbgPath3250 = null
-            )
-        }
 
         // ✅ DIMENSIONES STILL
         val wFull = stillBmp.width
         val hFull = stillBmp.height
         val nFull = wFull * hFull
 
-        // ✅ FULL EDGE MAP debe matchear STILL
-        if (edgeMapFullBmp3250.width != wFull || edgeMapFullBmp3250.height != hFull) {
+        if (edgeMapFullU8_3250 == null || edgeMapFullU8_3250.size != nFull) {
             Log.e(
                 TAG,
-                "EDGE_FULL size mismatch: edge=${edgeMapFullBmp3250.width}x${edgeMapFullBmp3250.height} still=${wFull}x${hFull}"
+                "EDGE_FULL missing/bad: edges=${edgeMapFullU8_3250?.size} expected=$nFull. Abort arcfit."
             )
-            return FitPack3250(
-                pxPerMmFaceD = roiSrc.pxPerMmGuessFace.toDouble(),
-                placedOdUsed = null,
-                placedOiUsed = null,
-                rimOd = null,
-                rimOi = null,
-                dbgPath3250 = null
-            )
-        }
-
-        val edgesFullU8: ByteArray = edgeMapFullBmp3250.toEdgeMapU8()
-        if (edgesFullU8.size != nFull) {
-            Log.e(TAG, "EDGE_FULL bad size edges=${edgesFullU8.size} expected=$nFull")
             return FitPack3250(
                 pxPerMmFaceD = roiSrc.pxPerMmGuessFace.toDouble(),
                 placedOdUsed = null,
@@ -966,7 +1068,7 @@ object DnpFacePipeline3250 {
 
         for (yy in 0 until hOd) {
             System.arraycopy(
-                edgesFullU8, (odT + yy) * wFull + odL,
+                edgeMapFullU8_3250, (odT + yy) * wFull + odL,
                 edgesOdU8, yy * wOd,
                 wOd
             )
@@ -986,7 +1088,7 @@ object DnpFacePipeline3250 {
 
         for (yy in 0 until hOi) {
             System.arraycopy(
-                edgesFullU8, (oiT + yy) * wFull + oiL,
+                edgeMapFullU8_3250, (oiT + yy) * wFull + oiL,
                 edgesOiU8, yy * wOi,
                 wOi
             )
@@ -999,7 +1101,10 @@ object DnpFacePipeline3250 {
         val hboxInnerMm = (filHboxMm - 2.0 * over).coerceAtLeast(10.0)
         val vboxInnerMm = (filVboxMm - 2.0 * over).coerceAtLeast(10.0)
 
-        Log.d(TAG, "FIL inset: overPerSideMm=$over -> innerHbox=$hboxInnerMm innerVbox=$vboxInnerMm")
+        Log.d(
+            TAG,
+            "FIL inset: overPerSideMm=$over -> innerHbox=$hboxInnerMm innerVbox=$vboxInnerMm"
+        )
 
         stage?.onStage(R.string.dnp_stage_rim_detecting)
 
@@ -1058,38 +1163,64 @@ object DnpFacePipeline3250 {
                 else {
                     val g = roiSrc.pxPerMmGuessFace.toDouble()
                     val pick = if (abs(odPx - g) <= abs(oiPx - g)) odPx else oiPx
-                    Log.w(TAG, "PX/MM seedFromRim[FACE]: OD/OI divergen od=$odPx oi=$oiPx relDiff=$relDiff -> pick=$pick (guess=$g)")
+                    Log.w(
+                        TAG,
+                        "PX/MM seedFromRim[FACE]: OD/OI divergen od=$odPx oi=$oiPx relDiff=$relDiff -> pick=$pick (guess=$g)"
+                    )
                     pick
                 }
             }
+
             odPx != null -> {
                 Log.w(TAG, "PX/MM seedFromRim[FACE]: using OD only = $odPx")
                 odPx
             }
+
             oiPx != null -> {
                 Log.w(TAG, "PX/MM seedFromRim[FACE]: using OI only = $oiPx")
                 oiPx
             }
+
             else -> {
                 val g = roiSrc.pxPerMmGuessFace.toDouble()
                 Log.e(TAG, "PX/MM seedFromRim[FACE]: FAIL (W). Using guess=$g")
                 g
             }
         }
+        val seed = DnpScale3250.pxPerMmSeedFromRimWidth3250(
+            rimOd = rimOd,
+            rimOi = rimOi,
+            hboxInnerMm = hboxInnerMm,
+            pxPerMmGuessFace = roiSrc.pxPerMmGuessFace,
+            tag = "FACE"
+        )
 
-        val pxPerMmOfficialClamped = pxPerMmOfficialRaw
-            .takeIf { it.isFinite() && it > 1e-6 }
-            ?.coerceIn(1.5, 20.0)
-            ?: roiSrc.pxPerMmGuessFace.toDouble()
+        val pxPerMmOfficial = if (seed.seedPxPerMm.isFinite()) {
+            seed.seedPxPerMm.toDouble()
+        } else {
+            roiSrc.pxPerMmGuessFace.toDouble() // fallback
+        }
 
-        Log.d(TAG, "PX/MM used[FACE]=$pxPerMmOfficialClamped (od=$odPx oi=$oiPx guess=${roiSrc.pxPerMmGuessFace})")
+// si ya tenías clamp, dejalo igual
+        val pxPerMmOfficialClamped = pxPerMmOfficial.coerceIn(0.5, 30.0)
+
+        Log.d(
+            TAG,
+            "PX/MM seedFromRim[FACE]: od=${seed.pxPerMmOd} oi=${seed.pxPerMmOi} used=${seed.seedPxPerMm} src=${seed.src} -> usedClamped=$pxPerMmOfficialClamped"
+        )
+
+
+        Log.d(
+            TAG,
+            "PX/MM used[FACE]=$pxPerMmOfficialClamped (od=$odPx oi=$oiPx guess=${roiSrc.pxPerMmGuessFace})"
+        )
 
         // ✅ Seeds usando EXACTAMENTE el ROI canónico (el recorte)
         val seedOd = RimArcSeed3250.seedFromPupilOrRoi3250(
             roiCv = roiOdCvCanon,
             filHboxMm = hboxInnerMm,
             filVboxMm = vboxInnerMm,
-            pxPerMmGuess = roiSrc.pxPerMmGuessFace,
+            pxPerMmGuess = pxPerMmOfficialClamped.toFloat(),
             midlineXpxGlobal = roiSrc.midXBridgeGlobal3250,
             pupilGlobal = pm.pupilOdForRoi,
             usePupil3250 = false,
@@ -1100,7 +1231,7 @@ object DnpFacePipeline3250 {
             roiCv = roiOiCvCanon,
             filHboxMm = hboxInnerMm,
             filVboxMm = vboxInnerMm,
-            pxPerMmGuess = roiSrc.pxPerMmGuessFace,
+            pxPerMmGuess = pxPerMmOfficialClamped.toFloat(),
             midlineXpxGlobal = roiSrc.midXBridgeGlobal3250,
             pupilGlobal = pm.pupilOiForRoi,
             usePupil3250 = false,
@@ -1116,14 +1247,16 @@ object DnpFacePipeline3250 {
 
         val bottomAnchorOdYpxRoi = run {
             val yLocal =
-                rimOd?.takeIf { it.ok }?.bottomYpx?.takeIf { it.isFinite() }?.let { it - odT.toFloat() }
+                rimOd?.takeIf { it.ok }?.bottomYpx?.takeIf { it.isFinite() }
+                    ?.let { it - odT.toFloat() }
                     ?: (seedOd.originPxRoi.y + 0.40f * (vboxInnerMm * pxPerMmOfficialClamped).toFloat())
             yLocal.coerceIn(0f, (hOd - 1).toFloat())
         }
 
         val bottomAnchorOiYpxRoi = run {
             val yLocal =
-                rimOi?.takeIf { it.ok }?.bottomYpx?.takeIf { it.isFinite() }?.let { it - oiT.toFloat() }
+                rimOi?.takeIf { it.ok }?.bottomYpx?.takeIf { it.isFinite() }
+                    ?.let { it - oiT.toFloat() }
                     ?: (seedOi.originPxRoi.y + 0.40f * (vboxInnerMm * pxPerMmOfficialClamped).toFloat())
             yLocal.coerceIn(0f, (hOi - 1).toFloat())
         }
@@ -1133,7 +1266,7 @@ object DnpFacePipeline3250 {
                 filPtsMm = filOdMm.ptsMm,
                 filHboxMm = filHboxMm,
                 filVboxMm = filVboxMm,
-                edgesGray = pack.edges, // ✅ debe ser ROI-local (wOd*hOd)
+                edgesGray = pack.edges, // ✅ ROI-local (wOd*hOd)
                 w = pack.w,
                 h = pack.h,
                 originPxRoi = seedOd.originPxRoi,
@@ -1178,59 +1311,58 @@ object DnpFacePipeline3250 {
 
         // ============================================================
         // ✅ EDGE + ARC-FIT DEBUG: TODO EN ROI-LOCAL
-        // offsets SIEMPRE desde el ROI canónico (odL/odT, oiL/oiT)
         // ============================================================
         if (saveEdgeArcfitDebugToGallery3250) {
             detOd?.let { pack ->
                 val r = pack.result
-                val placedRoi = fitArcOd?.placedPxRoi
-                if (placedRoi != null) {
-                    fun xLocal(v: Float?): Int? = fToLocalIntOrNull3250(v, odL, pack.w)
-                    fun yLocal(v: Float?): Int? = fToLocalIntOrNull3250(v, odT, pack.h)
+                fun xLocal(v: Float?): Int? = fToLocalIntOrNull3250(v, odL, pack.w)
+                fun yLocal(v: Float?): Int? = fToLocalIntOrNull3250(v, odT, pack.h)
 
-                    val debugUri = EdgeArcfitDebugDump3250.saveEdgeWithArcfitMarksToGallery3250(
-                        ctx = ctx,
-                        eyeTag = "OD",
-                        edgeGray = pack.edges,
-                        w = pack.w,
-                        h = pack.h,
-                        innerLeftPx = xLocal(r.innerLeftXpx),
-                        innerRightPx = xLocal(r.innerRightXpx),
-                        outerNasalPx = null,
-                        outerTemplePx = null,
-                        topPx = yLocal(r.topYpx),
-                        bottomPx = yLocal(r.bottomYpx),
-                        probeYPx = yLocal(r.probeYpx),
-                        placedPxRoi = placedRoi
-                    )
-                    Log.d("EDGE_SAVE3250", "OD debugUri=$debugUri")
-                }
+                val debugUri = EdgeArcfitDebugDump3250.saveEdgeWithArcfitMarksToGallery3250(
+                    ctx = ctx,
+                    eyeTag = "OD",
+                    edgeGray = pack.edges,
+                    w = pack.w,
+                    h = pack.h,
+                    innerLeftPx = xLocal(r.innerLeftXpx),
+                    innerRightPx = xLocal(r.innerRightXpx),
+                    outerNasalPx = null,
+                    outerTemplePx = null,
+                    topPx = yLocal(r.topYpx),
+                    bottomPx = yLocal(r.bottomYpx),
+                    probeYPx = yLocal(r.probeYpx),
+                    placedPxRoi = fitArcOd?.placedPxRoi // 👈 puede ser null, igual guardamos
+                )
+                Log.d(
+                    "EDGE_SAVE3250",
+                    "OD debugUri=$debugUri placed=${fitArcOd?.placedPxRoi?.size ?: 0}"
+                )
             }
 
             detOi?.let { pack ->
                 val r = pack.result
-                val placedRoi = fitArcOi?.placedPxRoi
-                if (placedRoi != null) {
-                    fun xLocal(v: Float?): Int? = fToLocalIntOrNull3250(v, oiL, pack.w)
-                    fun yLocal(v: Float?): Int? = fToLocalIntOrNull3250(v, oiT, pack.h)
+                fun xLocal(v: Float?): Int? = fToLocalIntOrNull3250(v, oiL, pack.w)
+                fun yLocal(v: Float?): Int? = fToLocalIntOrNull3250(v, oiT, pack.h)
 
-                    val debugUri = EdgeArcfitDebugDump3250.saveEdgeWithArcfitMarksToGallery3250(
-                        ctx = ctx,
-                        eyeTag = "OI",
-                        edgeGray = pack.edges,
-                        w = pack.w,
-                        h = pack.h,
-                        innerLeftPx = xLocal(r.innerLeftXpx),
-                        innerRightPx = xLocal(r.innerRightXpx),
-                        outerNasalPx = null,
-                        outerTemplePx = null,
-                        topPx = yLocal(r.topYpx),
-                        bottomPx = yLocal(r.bottomYpx),
-                        probeYPx = yLocal(r.probeYpx),
-                        placedPxRoi = placedRoi
-                    )
-                    Log.d("EDGE_SAVE3250", "OI debugUri=$debugUri")
-                }
+                val debugUri = EdgeArcfitDebugDump3250.saveEdgeWithArcfitMarksToGallery3250(
+                    ctx = ctx,
+                    eyeTag = "OI",
+                    edgeGray = pack.edges,
+                    w = pack.w,
+                    h = pack.h,
+                    innerLeftPx = xLocal(r.innerLeftXpx),
+                    innerRightPx = xLocal(r.innerRightXpx),
+                    outerNasalPx = null,
+                    outerTemplePx = null,
+                    topPx = yLocal(r.topYpx),
+                    bottomPx = yLocal(r.bottomYpx),
+                    probeYPx = yLocal(r.probeYpx),
+                    placedPxRoi = fitArcOi?.placedPxRoi
+                )
+                Log.d(
+                    "EDGE_SAVE3250",
+                    "OI debugUri=$debugUri placed=${fitArcOi?.placedPxRoi?.size ?: 0}"
+                )
             }
         }
 
@@ -1294,8 +1426,12 @@ object DnpFacePipeline3250 {
         val dbgUri = saveDebugBitmapToCache3250(
             ctx = ctx,
             fileName = "DBG_FACE_${System.currentTimeMillis()}.png",
-            bmp = dbgBmp
+            bmp = dbgBmp,
+            alsoCopyToGallery3250 = saveEdgeArcfitDebugToGallery3250, // tu switch
+            galleryRelativePath3250 = "Pictures/PrecalDNP/DEBUG"
         )
+
+
         try { dbgBmp.recycle() } catch (_: Throwable) {}
 
         val dbgUriStr = dbgUri?.toString()
@@ -1377,9 +1513,12 @@ object DnpFacePipeline3250 {
     private fun saveDebugBitmapToCache3250(
         ctx: Context,
         fileName: String,
-        bmp: Bitmap
+        bmp: Bitmap,
+        alsoCopyToGallery3250: Boolean = false,
+        galleryRelativePath3250: String = "Pictures/PrecalDNP/DEBUG"
     ): Uri? {
-        return try {
+
+        val dbgUri: Uri? = try {
             val dir = File(ctx.cacheDir, "debug3250").apply { mkdirs() }
             val f = File(dir, fileName)
             FileOutputStream(f).use { out ->
@@ -1390,6 +1529,27 @@ object DnpFacePipeline3250 {
             Log.e(TAG, "saveDebugBitmapToCache3250 error", t)
             null
         }
+
+        if (alsoCopyToGallery3250 && dbgUri != null) {
+            val g = copyUriToGallery3250(
+                ctx = ctx,
+                srcUri = dbgUri,
+                displayName = fileName,
+                relativePath = galleryRelativePath3250
+            )
+            Log.d(TAG, "DBG_FACE copied to gallery: $g")
+        }
+
+        return dbgUri
+    }
+
+    private fun copyUriToGallery3250(
+        ctx: Context,
+        srcUri: Uri,
+        displayName: String,
+        relativePath: String
+    )
+    {
     }
 
     fun metricsToMeasurementResult3250(
@@ -1414,27 +1574,5 @@ object DnpFacePipeline3250 {
             annotatedPath = dbgUriStr ?: "",
             originalPath = originalUriStr
         )
-    }
-
-    // ============================================================
-    // ✅ FULL-FRAME edgeMap Bitmap -> ByteArray(0/255)
-    // ============================================================
-    private fun Bitmap.toEdgeMapU8(): ByteArray {
-        val w = width
-        val h = height
-        val px = IntArray(w * h)
-        getPixels(px, 0, w, 0, 0, w, h)
-
-        val out = ByteArray(w * h)
-        for (i in px.indices) {
-            val p = px[i]
-            val a = (p ushr 24) and 0xFF
-            val r = (p ushr 16) and 0xFF
-            val g = (p ushr 8) and 0xFF
-            val b = p and 0xFF
-            val v = max(r, max(g, b)) // edgeMap suele venir blanco
-            out[i] = if (a != 0 && v >= 8) 0xFF.toByte() else 0
-        }
-        return out
     }
 }
