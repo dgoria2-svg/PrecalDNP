@@ -1122,7 +1122,9 @@ object DnpFacePipeline3250 {
             pupilGlobal = pm.pupilOdForRoi,
             debugTag = "OD",
             pxPerMmGuessFace = roiSrc.pxPerMmGuessFace,
-            seedXpxGlobal3250 = null
+            seedXpxGlobal3250 = null,
+            dirU8 = null
+
         )
 
         val detOi = RimDetectorBlock3250.detectRim(
@@ -1139,6 +1141,7 @@ object DnpFacePipeline3250 {
             debugTag = "OI",
             pxPerMmGuessFace = roiSrc.pxPerMmGuessFace,
             seedXpxGlobal3250 = null
+
         )
 
         fun pxFrom(r: RimDetectionResult?): Double? {
@@ -1149,8 +1152,35 @@ object DnpFacePipeline3250 {
             return pxmm.takeIf { it.isFinite() && it > 1e-6 }
         }
 
-        val rimOd: RimDetectionResult? = detOd?.result
-        val rimOi: RimDetectionResult? = detOi?.result
+        val detOd0 = detOd
+        val detOi0 = detOi
+
+        val detOiFinal = detOi0 ?: detOd0?.let { odPack ->
+            RimDetectorBlock3250.mirrorFromOtherEye3250(
+                primary = odPack.result,
+                targetEdgesU8 = edgesOI,
+                w = wOI, h = hOI,
+                targetRoiGlobal = roiOI,
+                midlineXpx = midX,
+                debugTag = "OI",
+                srcTag = "OD"
+            )
+        }
+
+        val detOdFinal = detOd0 ?: detOi0?.let { oiPack ->
+            RimDetectorBlock3250.mirrorFromOtherEye3250(
+                primary = oiPack.result,
+                targetEdgesU8 = edgesOD,
+                w = wOD, h = hOD,
+                targetRoiGlobal = roiOD,
+                midlineXpx = midX,
+                debugTag = "OD",
+                srcTag = "OI"
+            )
+        }
+
+        val rimOd: RimDetectionResult? = detOdFinal?.result
+        val rimOi: RimDetectionResult? = detOiFinal?.result
 
         val odPx = pxFrom(rimOd)
         val oiPx = pxFrom(rimOi)
