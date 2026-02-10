@@ -60,8 +60,9 @@ object EdgeMapBuilder3250 {
     //    Arriba reduce score, pero NO anula todo.
     private const val TOPKILL_MIN_WEIGHT = 0.10f  // 10% del score arriba (para que nunca quede negro)
     // 2) Mask suave: en pixels masked usamos blur (flatten) y además reducimos score.
-    private const val MASK_SCORE_WEIGHT = 0.55f   // 55% del score en zona mask (evita textura sin agujeros)
+    private const val MASK_SCORE_WEIGHT = 0.40f   // 40% del score en zona mask (evita textura sin agujeros)
 
+    // Mantiene tu EdgeStats tal cual:
     data class EdgeStats(
         val maxScore: Float,
         val p95Score: Float,
@@ -72,6 +73,16 @@ object EdgeMapBuilder3250 {
         val samples: Int,
         val topKillY: Int
     )
+
+    // ✅ Nuevo: pack de salida (edges + dir + stats)
+    data class EdgeMapOut3250(
+        val w: Int,
+        val h: Int,
+        val edgesU8: ByteArray, // 0/255 post-hysteresis
+        val dirU8: ByteArray,   // dir cuantizada por pixel (mismo N)
+        val stats: EdgeStats
+    )
+
 
     private fun u8(b: Byte): Int = b.toInt() and 0xFF
 
@@ -153,7 +164,16 @@ object EdgeMapBuilder3250 {
         return out
     }
 
-    fun buildFullFrameEdgeMapFromGrayU8_3250(
+    /**
+     * ✅ Versión corregida: devuelve el pack completo (edges + dir + stats).
+     *
+     * Nota: tus helpers/constantes se asumen existentes:
+     * - boxBlur3x3U8, u8
+     * - quantizeDir3250, nmsNeighbors3250
+     * - percentileFromHist3250, computeThrHigh3250
+     * - TOPKILL_MIN_WEIGHT, MASK_SCORE_WEIGHT, K_H, K_V, EDGE_THR_MIN, HYST_LOW_FRAC
+     */
+    fun buildFullFrameEdgePackFromGrayU8_3250(
         w: Int,
         h: Int,
         grayU8: ByteArray,
@@ -162,21 +182,31 @@ object EdgeMapBuilder3250 {
         maskFull: ByteArray? = null,
         debugTag: String = "FULL",
         statsOut: ((EdgeStats) -> Unit)? = null
-    ): ByteArray {
+    ): EdgeMapOut3250 {
+
+        if (w <= 0 || h <= 0) {
+            val st = EdgeStats(0f, 0f, 0f, 0, 0f, 0f, 0, topKillY)
+            return EdgeMapOut3250(0, 0, ByteArray(0), ByteArray(0), st)
+        }
 
         val N = w * h
-        if (w <= 0 || h <= 0) return ByteArray(0)
+
         if (grayU8.size != N) {
             Log.w(TAG, "EDGE_FULL[$debugTag] bad gray size=${grayU8.size} N=$N")
-            return ByteArray(0)
+            val st = EdgeStats(0f, 0f, 0f, 0, 0f, 0f, 0, topKillY.coerceIn(0, h))
+            return EdgeMapOut3250(w, h, ByteArray(N), ByteArray(N), st)
         }
         if (maskFull != null && maskFull.size != N) {
             Log.w(TAG, "EDGE_FULL[$debugTag] bad mask size=${maskFull.size} N=$N")
-            return ByteArray(0)
+            val st = EdgeStats(0f, 0f, 0f, 0, 0f, 0f, 0, topKillY.coerceIn(0, h))
+            return EdgeMapOut3250(w, h, ByteArray(N), ByteArray(N), st)
         }
 
         val B = borderKillPx.coerceIn(0, min(w, h) / 3)
+
+        // ✅ yKill: si viene fuera de rango, lo tratamos como "sin topkill"
         val yKill = topKillY.coerceIn(0, h)
+        val hasTopKill = (yKill in 1 until h)
 
         // blur para flattening (mask)
         val blurU8 = boxBlur3x3U8(grayU8, w, h)
@@ -199,11 +229,16 @@ object EdgeMapBuilder3250 {
 
         fun topWeight(y: Int): Float {
             // ✅ TopKill suave: arriba de yKill reduce score gradualmente pero nunca 0.
-            if (yKill <= 0) return 1f
+            if (!hasTopKill) return 1f
             if (y >= yKill) return 1f
             val t = y.toFloat() / yKill.toFloat().coerceAtLeast(1f) // 0..1
-            return (TOPKILL_MIN_WEIGHT + (1f - TOPKILL_MIN_WEIGHT) * t).coerceIn(TOPKILL_MIN_WEIGHT, 1f)
+            return (TOPKILL_MIN_WEIGHT + (1f - TOPKILL_MIN_WEIGHT) * t)
+                .coerceIn(TOPKILL_MIN_WEIGHT, 1f)
         }
+
+        // Precompute (evitás truncado distinto por pixel)
+        val kH100 = (K_H * 100f).toInt()
+        val kV100 = (K_V * 100f).toInt()
 
         // Pass 1: Scharr + score + dir + max
         for (y in 1 until (h - 1)) {
@@ -237,8 +272,8 @@ object EdgeMapBuilder3250 {
                 val ax = abs(gx)
                 val ay = abs(gy)
 
-                val hs100 = ay * 100 - (K_H * 100f).toInt() * ax
-                val vs100 = ax * 100 - (K_V * 100f).toInt() * ay
+                val hs100 = ay * 100 - kH100 * ax
+                val vs100 = ax * 100 - kV100 * ay
                 val s100 = max(0, max(hs100, vs100))
                 var s = (s100 / 100).coerceIn(0, 32767)
 
@@ -258,17 +293,44 @@ object EdgeMapBuilder3250 {
 
         if (validCount < 256 || maxScore <= 0) {
             Log.w(TAG, "EDGE_FULL[$debugTag] not enough signal valid=$validCount max=$maxScore topKillY=$yKill B=$B hasMask=$hasMask")
-            return ByteArray(N)
+            val st = EdgeStats(
+                maxScore = maxScore.toFloat(),
+                p95Score = 0f,
+                thr = 0f,
+                nnz = 0,
+                density = 0f,
+                bandPx = 0f,
+                samples = validCount,
+                topKillY = yKill
+            )
+            statsOut?.invoke(st)
+            return EdgeMapOut3250(w, h, ByteArray(N), dir, st)
         }
 
         // Pass 2: hist p95
         val bins = 2048
         val hist = IntArray(bins)
+
+        // ✅ Recomendado: p95 sin masked para que no te mueva umbrales.
+        // Si quedás sin muestras, cae al modo "all".
+        var histN = 0
         for (i in 0 until N) {
+            if (hasMask && isMasked(i)) continue
             val s = score[i].toInt()
             if (s <= 0) continue
             val bin = (s * (bins - 1)) / maxScore
             hist[bin]++
+            histN++
+        }
+        if (histN < 128) {
+            // fallback a todo
+            java.util.Arrays.fill(hist, 0)
+            for (i in 0 until N) {
+                val s = score[i].toInt()
+                if (s <= 0) continue
+                val bin = (s * (bins - 1)) / maxScore
+                hist[bin]++
+            }
         }
 
         val p95 = percentileFromHist3250(hist, bins, maxScore, 0.95f)
@@ -309,7 +371,18 @@ object EdgeMapBuilder3250 {
         val out = ByteArray(N)
         if (strongCount == 0 || candCount == 0) {
             Log.w(TAG, "EDGE_FULL[$debugTag] no strong/candidates (strong=$strongCount cand=$candCount) thrH=$thrHigh thrL=$thrLow")
-            return out
+            val st = EdgeStats(
+                maxScore = maxScore.toFloat(),
+                p95Score = p95.toFloat(),
+                thr = thrHigh.toFloat(),
+                nnz = 0,
+                density = 0f,
+                bandPx = 0f,
+                samples = validCount,
+                topKillY = yKill
+            )
+            statsOut?.invoke(st)
+            return EdgeMapOut3250(w, h, out, dir, st)
         }
 
         val q = IntArray(candCount)
@@ -349,6 +422,7 @@ object EdgeMapBuilder3250 {
         }
 
         val dens = nnz.toFloat() / N.toFloat().coerceAtLeast(1f)
+
         Log.d(
             TAG,
             "EDGE_FULL[$debugTag] max=$maxScore p95=$p95 thrH=$thrHigh thrL=$thrLow " +
@@ -356,20 +430,45 @@ object EdgeMapBuilder3250 {
                     "topKillY=$yKill B=$B hasMask=$hasMask"
         )
 
-        statsOut?.invoke(
-            EdgeStats(
-                maxScore = maxScore.toFloat(),
-                p95Score = p95.toFloat(),
-                thr = thrHigh.toFloat(),
-                nnz = nnz,
-                density = dens,
-                bandPx = 0f,
-                samples = validCount,
-                topKillY = yKill
-            )
+        val st = EdgeStats(
+            maxScore = maxScore.toFloat(),
+            p95Score = p95.toFloat(),
+            thr = thrHigh.toFloat(),
+            nnz = nnz,
+            density = dens,
+            bandPx = 0f,
+            samples = validCount,
+            topKillY = yKill
         )
+        statsOut?.invoke(st)
 
-        return out
+        return EdgeMapOut3250(w, h, out, dir, st)
+    }
+
+    /**
+     * ✅ Wrapper para no romper call-sites: mantiene TU firma original y devuelve ByteArray.
+     * Si querés dir/stats, llamás al pack y usás .dirU8 / .stats
+     */
+    fun buildFullFrameEdgeMapFromGrayU8_3250(
+        w: Int,
+        h: Int,
+        grayU8: ByteArray,
+        borderKillPx: Int,
+        topKillY: Int = 0,
+        maskFull: ByteArray? = null,
+        debugTag: String = "FULL",
+        statsOut: ((EdgeStats) -> Unit)? = null
+    ): ByteArray {
+        return buildFullFrameEdgePackFromGrayU8_3250(
+            w = w,
+            h = h,
+            grayU8 = grayU8,
+            borderKillPx = borderKillPx,
+            topKillY = topKillY,
+            maskFull = maskFull,
+            debugTag = debugTag,
+            statsOut = statsOut
+        ).edgesU8
     }
 
     // ============================================================
