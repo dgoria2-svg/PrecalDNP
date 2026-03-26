@@ -3,7 +3,6 @@ package com.dg.precaldnp.ui
 import android.graphics.Bitmap
 import android.graphics.PointF
 import android.util.Log
-import java.util.Arrays
 import kotlin.math.abs
 import kotlin.math.hypot
 
@@ -126,7 +125,10 @@ object DnpFaceMetrics3250 {
             }
 
             "NO_PUPIL" -> {
-                Log.w(TAG, "DNP3250 NO_PUPIL: sin pupilas -> DNP/NPD = NaN (pero puente puede salir por nasal-nasal)")
+                Log.w(
+                    TAG,
+                    "DNP3250 NO_PUPIL: sin pupilas -> DNP/NPD = NaN (pero puente puede salir por nasal-nasal)"
+                )
             }
         }
 
@@ -166,6 +168,17 @@ object DnpFaceMetrics3250 {
 
         val midRef = midXAt(yRef)
 
+        val odSideSign = when {
+            odPupil != null && odPupil.x < midRef -> -1f
+            odPupil != null && odPupil.x >= midRef -> +1f
+            else -> -1f
+        }
+
+        val oiSideSign = when {
+            oiPupil != null && oiPupil.x < midRef -> -1f
+            oiPupil != null && oiPupil.x >= midRef -> +1f
+            else -> +1f
+        }
         // ✅ IMPORTANTÍSIMO:
         // - Si te falta el placed de un ojo, lo espejamos sobre la midline para poder sacar nasal-nasal
         // - Esto te evita "Puente: -" cuando ArcFit te dio sólo 1 ojo en ese frame
@@ -176,7 +189,7 @@ object DnpFaceMetrics3250 {
 
         val nasalOdX = nasalFromPlacedTowardMidline3250(
             placedPtsGlobal = placedOdEff,
-            sideSign = +1f,              // OD = derecha
+            sideSign = odSideSign,              // OD = derecha
             midXAtRef = midRef,
             yRefGlobal = yRef,
             bandHalfPx = pnBandHalfPx,
@@ -184,7 +197,7 @@ object DnpFaceMetrics3250 {
         )
         val nasalOiX = nasalFromPlacedTowardMidline3250(
             placedPtsGlobal = placedOiEff,
-            sideSign = -1f,              // OI = izquierda
+            sideSign = oiSideSign,              // OI = izquierda
             midXAtRef = midRef,
             yRefGlobal = yRef,
             bandHalfPx = pnBandHalfPx,
@@ -208,9 +221,11 @@ object DnpFaceMetrics3250 {
         } else Double.NaN
 
         // Puente preferido (solo si BINOC y tenemos todo)
-        val bridgeDnpMm = if (mode == "BINOC" && dnpTotalMm.isFinite() && pnOdMm.isFinite() && pnOiMm.isFinite()) {
-            (dnpTotalMm - pnOdMm - pnOiMm + bridgeOffsetMm).takeIf { it.isFinite() } ?: Double.NaN
-        } else Double.NaN
+        val bridgeDnpMm =
+            if (mode == "BINOC" && dnpTotalMm.isFinite() && pnOdMm.isFinite() && pnOiMm.isFinite()) {
+                (dnpTotalMm - pnOdMm - pnOiMm + bridgeOffsetMm).takeIf { it.isFinite() }
+                    ?: Double.NaN
+            } else Double.NaN
 
         bridgeMm = if (bridgeDnpMm.isFinite()) bridgeDnpMm else bridgeNasalMm
 
@@ -248,9 +263,17 @@ object DnpFaceMetrics3250 {
         // 4) Ø útil (pupila -> placed FIL) +2mm
         // ============================================================
         val diamUtilOdMm =
-            if (odPupil != null) diameterUtilMmFromPlacedFil(odPupil, placedOdEff, pxPerMmFaceD) else Double.NaN
+            if (odPupil != null) diameterUtilMmFromPlacedFil(
+                odPupil,
+                placedOdEff,
+                pxPerMmFaceD
+            ) else Double.NaN
         val diamUtilOiMm =
-            if (oiPupil != null) diameterUtilMmFromPlacedFil(oiPupil, placedOiEff, pxPerMmFaceD) else Double.NaN
+            if (oiPupil != null) diameterUtilMmFromPlacedFil(
+                oiPupil,
+                placedOiEff,
+                pxPerMmFaceD
+            ) else Double.NaN
 
         return DnpMetrics3250(
             mode3250 = mode,
@@ -289,6 +312,7 @@ object DnpFaceMetrics3250 {
         if (hPx <= 1.0f) return Double.NaN
         return hPx.toDouble() / pxPerMm
     }
+
 
     private fun nasalFromPlacedTowardMidline3250(
         placedPtsGlobal: List<PointF>?,
@@ -332,7 +356,14 @@ object DnpFaceMetrics3250 {
             TAG,
             "NASAL3250 n=${xs.size} side=${if (sideSign > 0f) "OD_RIGHT" else "OI_LEFT"} q=$q idx=$idx " +
                     "x=%.1f bandPx=%.1f yRef=%.1f midX=%.1f maxFromMid=%.1f pupilDist=%.1f"
-                        .format(picked, bandHalfPx, yRefGlobal, midXAtRef, maxFromMid, (pupilDistToMid ?: -1f))
+                        .format(
+                            picked,
+                            bandHalfPx,
+                            yRefGlobal,
+                            midXAtRef,
+                            maxFromMid,
+                            (pupilDistToMid ?: -1f)
+                        )
         )
         return picked
     }
@@ -359,21 +390,19 @@ object DnpFaceMetrics3250 {
         if (placedFilPx.isNullOrEmpty()) return Double.NaN
         if (!pxPerMmFaceD.isFinite() || pxPerMmFaceD <= 1e-9) return Double.NaN
 
-        val dists = DoubleArray(placedFilPx.size)
-        var n = 0
+        var maxDistPx = Double.NaN
+
         for (p in placedFilPx) {
             val d = hypot((p.x - pupilPx.x).toDouble(), (p.y - pupilPx.y).toDouble())
-            if (d.isFinite()) dists[n++] = d
+            if (!d.isFinite()) continue
+            if (!maxDistPx.isFinite() || d > maxDistPx) {
+                maxDistPx = d
+            }
         }
-        if (n < 8) return Double.NaN
 
-        Arrays.sort(dists, 0, n)
+        if (!maxDistPx.isFinite()) return Double.NaN
 
-        val q = 0.98
-        val idx = (q * (n - 1)).toInt().coerceIn(0, n - 1)
-        val rPx = dists[idx]
-
-        val diamMm = (2.0 * rPx) / pxPerMmFaceD
+        val diamMm = (2.0 * maxDistPx) / pxPerMmFaceD
         return (diamMm + 2.0).coerceAtLeast(0.0)
     }
 }

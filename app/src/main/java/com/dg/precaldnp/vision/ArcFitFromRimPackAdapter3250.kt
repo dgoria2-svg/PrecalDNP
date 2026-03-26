@@ -2,6 +2,7 @@ package com.dg.precaldnp.vision
 
 import android.graphics.PointF
 import android.graphics.RectF
+import android.util.Log
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
@@ -9,30 +10,11 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
 
-/**
- * RimDetectPack3250 (EDGE-IN) -> FilPlaceFromArc3250 (ARC-FIT)
- *
- * ✅ Ancla por arco inferior usando bottomPolylinePx -> ventana angular (deg modelo).
- * ✅ Deriva px/mm oficial desde el FIL calzado (spanX/spanY en ejes del modelo) con helper.
- * ✅ Extrae inner en una línea Y (bridgeRow) con helper.
- *
- * Consume (del pack):
- * - pack.edges / pack.w / pack.h  (edgeMap ROI-local binario 0/255)
- * - pack.result.roiPx             (GLOBAL)
- * - pack.result.bottomYpx         (GLOBAL)
- * - pack.result.innerWidthPx      (seed/observed opcional)
- * - pack.result.bottomPolylinePx  (GLOBAL)  <-- para arco inferior
- *
- * Consume (del seed):
- * - seed.originPxRoi + seed.pxPerMmInitGuess
- */
 object ArcFitAdapter3250 {
 
+    private const val TAG = "ArcFitAdapter3250"
     private const val BOTTOM_DEG = 270.0
 
-    // ------------------------------------------------------------
-    // Outputs auxiliares (escala + inner en bridgeRow)
-    // ------------------------------------------------------------
     data class PxMmPack3250(
         val pxPerMmX: Double,
         val pxPerMmY: Double,
@@ -57,9 +39,49 @@ object ArcFitAdapter3250 {
         val expandedByDeg: Double
     )
 
-    // ------------------------------------------------------------
-    // Entry
-    // ------------------------------------------------------------
+    data class ArcFitContract3250(
+        val roiPxGlobal: RectF,
+        val edgesRoiU8: ByteArray,
+        val maskRoiU8: ByteArray?,
+        val wRoi: Int,
+        val hRoi: Int,
+        val eyeSideSign3250: Int,
+        val profile3250: RimProfile3250,
+        val originPxRoi: PointF,
+        val pxPerMmInitGuess: Double,
+
+        // =========================
+        // VERDAD DEL DETECTOR
+        // =========================
+        val bottomAnchorYpxGlobal: Float,
+        val bottomAnchorYpxRoi: Float,
+
+        val detectorWallsYpxGlobal: Float,
+        val detectorWallsYpxRoi: Float,
+
+        val nasalXAtWallsRoi: Float?,
+        val templeXAtWallsRoi: Float?,
+        val pxPerMmObservedAtWalls: Double?,
+
+        // =========================
+        // VERDAD FACIAL / METRICS
+        // =========================
+        val bridgeRowYpxGlobal: Float,
+        val bridgeRowYpxRoi: Float,
+
+        // soporte geométrico / debug
+        val bottomPolylinePxRoi: List<PointF>,
+        val nasalInnerPolylinePxRoi: List<PointF>,
+        val templeInnerPolylinePxRoi: List<PointF>,
+        val nasalOuterPolylinePxRoi: List<PointF>?,
+        val templeOuterPolylinePxRoi: List<PointF>?,
+        val bottomArcWindow: ArcWindow3250?,
+
+        val bottomConfidence: Float,
+        val lateralConfidence: Float,
+        val contractConfidence: Float
+    )
+
     fun arcFitFromRimPack3250(
         filPtsMm: List<PointF>,
         filHboxMm: Double,
@@ -68,123 +90,311 @@ object ArcFitAdapter3250 {
         maskU8Roi: ByteArray? = null,
         pack: RimDetectPack3250,
         seed: RimArcSeed3250.ArcSeed3250,
-
-        // -1 OD, +1 OI
         eyeSideSign3250: Int,
-
-        // si ya tenés px/mm “seed/observed” (por ancho), pasalo acá
+        bridgeRowYpxGlobal: Float,
+        profile3250: RimProfile3250,
         pxPerMmObservedOverride: Double? = null,
-
-        // si ya calculaste bottomAnchorYpxRoi afuera, pasalo acá
         bottomAnchorYpxRoiOverride: Float? = null,
-
-        // ventana del arco inferior: cuánto expandimos (deg) si está muy corto
         anchorArcExpandDeg: Double = 18.0,
-
         iters: Int = 2
     ): FilPlaceFromArc3250.Fit3250? {
 
         val r = pack.result
-        if (r.ok != true) return null
+        if (!r.ok) return null
 
-        val over = filOverInnerMmPerSide3250.takeIf { it.isFinite() } ?: 0.5
-        val overClamped = over.coerceIn(0.0, 2.0)
-
-        // HBOX/VBOX inner consistentes con buildCenteredInnerPolyMm()
-        val hboxInnerMm = (filHboxMm - 2.0 * overClamped).coerceAtLeast(10.0)
-
-        // observed “blando”: por innerWidth (detector) o override
-        val pxObsFromInner = run {
-            val iw = r.innerWidthPx.toDouble()
-            val v = (iw / hboxInnerMm)
-            v.takeIf { it.isFinite() && it > 1e-6 }
-        }
+        val contract = buildArcFitContract3250(
+            pack = pack,
+            seed = seed,
+            eyeSideSign3250 = eyeSideSign3250,
+            profile3250 = profile3250,
+            bridgeRowYpxGlobal = bridgeRowYpxGlobal,
+            filHboxMm = filHboxMm,
+            filOverInnerMmPerSide3250 = filOverInnerMmPerSide3250,
+            maskU8Roi = maskU8Roi,
+            anchorArcExpandDeg = anchorArcExpandDeg
+        ) ?: return null
 
         val pxObs = pxPerMmObservedOverride
             ?.takeIf { it.isFinite() && it > 1e-6 }
-            ?: pxObsFromInner
+            ?: contract.pxPerMmObservedAtWalls
 
-        val guess = seed.pxPerMmInitGuess
+        val pxInit = contract.pxPerMmInitGuess
             .takeIf { it.isFinite() && it > 1e-6 }
             ?: pxObs
             ?: 5.0
 
-        // bottomYpx GLOBAL -> ROI-local
-        val bottomAnchorYpxRoi: Float? =
-            bottomAnchorYpxRoiOverride
-                ?.takeIf { it.isFinite() }
-                ?: r.bottomYpx
-                    .takeIf { it.isFinite() }
-                    ?.let { byG -> (byG - r.roiPx.top).toFloat() }
+        val bottomAnchorYpxRoi = bottomAnchorYpxRoiOverride
+            ?.takeIf { it.isFinite() }
+            ?: contract.bottomAnchorYpxRoi
 
-        // ------------------------------------------------------------
-        // Ventana angular del ARCO INFERIOR usando bottomPolylinePx
-        // (deg modelo de ArcFit: 0 nasal, 90 arriba, 180 temporal, 270 abajo)
-        // ------------------------------------------------------------
-        val arcWin = buildBottomArcWindowFromPolyline3250(
-            bottomPolylineGlobal = r.bottomPolylinePx,
-            roiGlobal = r.roiPx,
+        Log.d(
+            TAG,
+            "CONTRACT side=$eyeSideSign3250 profile=$profile3250 " +
+                    "bottomAnchorY=${f2(contract.bottomAnchorYpxRoi)} " +
+                    "wallsY=${f2(contract.detectorWallsYpxRoi)} " +
+                    "bridgeY=${f2(contract.bridgeRowYpxRoi)} " +
+                    "xAtWalls(n/t)=(${f2(contract.nasalXAtWallsRoi)},${f2(contract.templeXAtWallsRoi)}) " +
+                    "pxObs=${f4(pxObs)} bottomConf=${f3(contract.bottomConfidence)} " +
+                    "latConf=${f3(contract.lateralConfidence)} contractConf=${f3(contract.contractConfidence)} " +
+                    "arcWin=${contract.bottomArcWindow?.let { "${f1(it.fromDeg)}..${f1(it.toDeg)} len=${f1(it.lenDeg)}" } ?: "null"}"
+        )
+
+        val fit = FilPlaceFromArc3250.placeFilByArc3250(
+            filPtsMm = filPtsMm,
+            filHboxMm = filHboxMm,
+            filVboxMm = filVboxMm,
+            edgesu8 = contract.edgesRoiU8,
+            w = contract.wRoi,
+            h = contract.hRoi,
+            maskU8 = contract.maskRoiU8,
+            originPxRoi = contract.originPxRoi,
+            eyeSideSign3250 = contract.eyeSideSign3250,
+            pxPerMmInitGuess = pxInit,
+            pxPerMmObserved = pxObs,
+            pxPerMmFixed = null,
+            filOverInnerMmPerSide3250 = filOverInnerMmPerSide3250,
+            allowedArcFromDeg = contract.bottomArcWindow?.fromDeg,
+            allowedArcToDeg = contract.bottomArcWindow?.toDeg,
+            excludeDegFrom = if (contract.bottomArcWindow == null) 35.0 else 0.0,
+            excludeDegTo = if (contract.bottomArcWindow == null) 145.0 else 0.0,
+            stepDeg = 2.0,
+            iters = iters.coerceIn(1, 3),
+            rSearchRelLo = 0.70,
+            rSearchRelHi = 1.35,
+            bottomAnchorYpxRoi = bottomAnchorYpxRoi,
+
+            // ✅ guías reales del detector
+            bottomGuidePxRoi = contract.bottomPolylinePxRoi,
+            detectorNasalGuidePxRoi = contract.nasalInnerPolylinePxRoi,
+            detectorTempleGuidePxRoi = contract.templeInnerPolylinePxRoi,
+
+            rimProfile3250 = contract.profile3250,
+            bridgeRowYpxGlobal = contract.bridgeRowYpxGlobal,
+            bridgeRowYpxRoi = contract.bridgeRowYpxRoi
+        ) ?: return null
+
+        // ============================================================
+        // VALIDACIÓN HARD: contra la fila oficial del detector
+        // ============================================================
+        val innerAtWalls = innerAtRowFromFit3250(
+            fit = fit,
+            roiGlobal = contract.roiPxGlobal,
+            rowYpxGlobal = contract.detectorWallsYpxGlobal,
+            eyeSideSign3250 = contract.eyeSideSign3250,
+            midlineXpxGlobal = null
+        )
+
+        if (innerAtWalls != null) {
+            val spanFitPx =
+                (innerAtWalls.innerRightXGlobal - innerAtWalls.innerLeftXGlobal).toDouble()
+
+            val spanObsPx =
+                if (contract.nasalXAtWallsRoi != null && contract.templeXAtWallsRoi != null) {
+                    abs(contract.templeXAtWallsRoi - contract.nasalXAtWallsRoi).toDouble()
+                } else {
+                    Double.NaN
+                }
+
+            val relSpanErr =
+                if (spanFitPx.isFinite() && spanObsPx.isFinite() && spanObsPx > 1e-6) {
+                    abs(spanFitPx - spanObsPx) / spanObsPx
+                } else {
+                    Double.NaN
+                }
+
+            Log.d(
+                TAG,
+                "POSTFIT_DET side=$eyeSideSign3250 profile=$profile3250 " +
+                        "wallsY=${f2(innerAtWalls.yGlobal)} " +
+                        "innerL=${f2(innerAtWalls.innerLeftXGlobal)} " +
+                        "innerR=${f2(innerAtWalls.innerRightXGlobal)} " +
+                        "nasal=${f2(innerAtWalls.nasalXGlobal)} " +
+                        "temple=${f2(innerAtWalls.templeXGlobal)} " +
+                        "spanFit=${f4(spanFitPx)} spanObs=${f4(spanObsPx)} relErr=${f4(relSpanErr)}"
+            )
+        } else {
+            Log.w(
+                TAG,
+                "POSTFIT_DET side=$eyeSideSign3250 profile=$profile3250 " +
+                        "innerAtWalls=NULL wallsY=${f2(contract.detectorWallsYpxGlobal)}"
+            )
+        }
+
+        // ============================================================
+        // VALIDACIÓN SOFT: bridge row facial
+        // ============================================================
+        val innerAtBridge = innerAtBridgeRowFromFit3250(
+            fit = fit,
+            roiGlobal = contract.roiPxGlobal,
+            bridgeRowYpxGlobal = contract.bridgeRowYpxGlobal,
+            eyeSideSign3250 = contract.eyeSideSign3250,
+            midlineXpxGlobal = null
+        )
+
+        if (innerAtBridge != null) {
+            Log.d(
+                TAG,
+                "POSTFIT_BRIDGE side=$eyeSideSign3250 profile=$profile3250 " +
+                        "bridgeY=${f2(innerAtBridge.yGlobal)} " +
+                        "innerL=${f2(innerAtBridge.innerLeftXGlobal)} " +
+                        "innerR=${f2(innerAtBridge.innerRightXGlobal)} " +
+                        "nasal=${f2(innerAtBridge.nasalXGlobal)} " +
+                        "temple=${f2(innerAtBridge.templeXGlobal)}"
+            )
+        } else {
+            Log.w(
+                TAG,
+                "POSTFIT_BRIDGE side=$eyeSideSign3250 profile=$profile3250 " +
+                        "innerAtBridge=NULL bridgeY=${f2(contract.bridgeRowYpxGlobal)}"
+            )
+        }
+
+        return fit
+    }
+
+    fun buildArcFitContract3250(
+        pack: RimDetectPack3250,
+        seed: RimArcSeed3250.ArcSeed3250,
+        eyeSideSign3250: Int,
+        profile3250: RimProfile3250,
+        bridgeRowYpxGlobal: Float,
+        filHboxMm: Double,
+        filOverInnerMmPerSide3250: Double,
+        maskU8Roi: ByteArray? = null,
+        anchorArcExpandDeg: Double = 18.0
+    ): ArcFitContract3250? {
+
+        val r = pack.result
+        if (!r.ok) return null
+
+        val roi = r.roiPx
+
+        val bridgeRowYpxRoi = bridgeRowYpxGlobal - roi.top
+        if (!bridgeRowYpxRoi.isFinite()) return null
+
+        val effectiveOver = effectiveFilOverPerSide3250(profile3250, filOverInnerMmPerSide3250)
+        val hboxInnerMm = (filHboxMm - 2.0 * effectiveOver).coerceAtLeast(10.0)
+
+        val bottomPolylinePxRoi = localPolylineToRoi3250(r.bottomPolylinePx, roi)
+        val nasalInnerPolylinePxRoi = localPolylineToRoi3250(r.nasalInnerPolylinePx, roi)
+        val templeInnerPolylinePxRoi = localPolylineToRoi3250(r.templeInnerPolylinePx, roi)
+        val nasalOuterPolylinePxRoi = localPolylineToRoi3250Nullable(r.nasalOuterPolylinePx, roi)
+        val templeOuterPolylinePxRoi = localPolylineToRoi3250Nullable(r.templeOuterPolylinePx, roi)
+
+        // ============================================================
+        // VERDAD DEL DETECTOR
+        // ============================================================
+        val detectorWallsYpxRoi = r.wallsYpx.takeIf { it.isFinite() } ?: bridgeRowYpxRoi
+        val detectorWallsYpxGlobal = detectorWallsYpxRoi + roi.top
+
+        val bottomAnchorYpxRoi = r.bottomYpx.takeIf { it.isFinite() }
+            ?: bottomPolylinePxRoi.maxOfOrNull { it.y }
+            ?: return null
+        val bottomAnchorYpxGlobal = bottomAnchorYpxRoi + roi.top
+
+        val nasalXAtWallsRoi = r.nasalInnerXpx.takeIf { it.isFinite() }
+            ?: intersectPolylineWithHLineX3250(
+                pts = nasalInnerPolylinePxRoi,
+                y = detectorWallsYpxRoi
+            )
+
+        val templeXAtWallsRoi = r.templeInnerXpx.takeIf { it.isFinite() }
+            ?: intersectPolylineWithHLineX3250(
+                pts = templeInnerPolylinePxRoi,
+                y = detectorWallsYpxRoi
+            )
+
+        val observedSpanPx = r.innerWidthPx
+            .takeIf { it.isFinite() && it > 1e-6f }
+            ?.toDouble()
+            ?: run {
+                if (nasalXAtWallsRoi != null && templeXAtWallsRoi != null) {
+                    abs(templeXAtWallsRoi - nasalXAtWallsRoi).toDouble()
+                } else {
+                    Double.NaN
+                }
+            }
+
+        val pxPerMmObservedAtWalls = observedSpanPx
+            .takeIf { it.isFinite() && it > 1e-6 }
+            ?.div(hboxInnerMm)
+            ?.takeIf { it.isFinite() && it > 1e-6 }
+
+        val bottomArcWindow = buildBottomArcWindowFromPolylineRoi3250(
+            bottomPolylineRoi = bottomPolylinePxRoi,
             originPxRoi = seed.originPxRoi,
             eyeSideSign3250 = eyeSideSign3250,
             expandDeg = anchorArcExpandDeg
         )
 
-        // Fallback si no hay polyline: excluimos el arco superior grande
-        val fallbackExcludeFrom = 35.0
-        val fallbackExcludeTo = 145.0
+        val bottomConfidence = computeBottomConfidence3250(
+            bottomPolylineRoi = bottomPolylinePxRoi,
+            wRoi = pack.w
+        )
 
-        // ------------------------------------------------------------
-        // ARC-FIT
-        // ------------------------------------------------------------
-        return FilPlaceFromArc3250.placeFilByArc3250(
-            filPtsMm = filPtsMm,
-            filHboxMm = filHboxMm,
-            filVboxMm = filVboxMm,
+        val lateralConfidence = computeLateralConfidence3250(
+            nasalInnerPolylineRoi = nasalInnerPolylinePxRoi,
+            templeInnerPolylineRoi = templeInnerPolylinePxRoi,
+            nasalXAtAnchorRoi = nasalXAtWallsRoi,
+            templeXAtAnchorRoi = templeXAtWallsRoi,
+            anchorYpxRoi = detectorWallsYpxRoi,
+            hRoi = pack.h
+        )
 
-            edgesGray = pack.edges,
-            w = pack.w,
-            h = pack.h,
-            maskU8 = maskU8Roi,
+        val contractConfidence =
+            (0.45f * bottomConfidence + 0.55f * lateralConfidence).coerceIn(0f, 1f)
 
-            originPxRoi = seed.originPxRoi,
+        return ArcFitContract3250(
+            roiPxGlobal = roi,
+            edgesRoiU8 = pack.edges,
+            maskRoiU8 = maskU8Roi,
+            wRoi = pack.w,
+            hRoi = pack.h,
             eyeSideSign3250 = eyeSideSign3250,
+            profile3250 = profile3250,
+            originPxRoi = seed.originPxRoi,
+            pxPerMmInitGuess = seed.pxPerMmInitGuess,
 
-            pxPerMmInitGuess = guess,
-            pxPerMmObserved = pxObs,           // guante blando
-            pxPerMmFixed = null,               // sin lock duro acá
-            filOverInnerMmPerSide3250 = overClamped,
+            bottomAnchorYpxGlobal = bottomAnchorYpxGlobal,
+            bottomAnchorYpxRoi = bottomAnchorYpxRoi,
 
-            // ✅ si tenemos arco inferior: usamos allowedArcFrom/To
-            allowedArcFromDeg = arcWin?.fromDeg,
-            allowedArcToDeg = arcWin?.toDeg,
+            detectorWallsYpxGlobal = detectorWallsYpxGlobal,
+            detectorWallsYpxRoi = detectorWallsYpxRoi,
 
-            // fallback (si no hay ventana de arco)
-            excludeDegFrom = if (arcWin == null) fallbackExcludeFrom else 0.0,
-            excludeDegTo = if (arcWin == null) fallbackExcludeTo else 0.0,
+            nasalXAtWallsRoi = nasalXAtWallsRoi,
+            templeXAtWallsRoi = templeXAtWallsRoi,
+            pxPerMmObservedAtWalls = pxPerMmObservedAtWalls,
 
-            stepDeg = 2.0,
+            bridgeRowYpxGlobal = bridgeRowYpxGlobal,
+            bridgeRowYpxRoi = bridgeRowYpxRoi,
 
-            iters = iters.coerceIn(1, 3),
-            rSearchRelLo = 0.70,
-            rSearchRelHi = 1.35,
-
-            bottomAnchorYpxRoi = bottomAnchorYpxRoi
+            bottomPolylinePxRoi = bottomPolylinePxRoi,
+            nasalInnerPolylinePxRoi = nasalInnerPolylinePxRoi,
+            templeInnerPolylinePxRoi = templeInnerPolylinePxRoi,
+            nasalOuterPolylinePxRoi = nasalOuterPolylinePxRoi,
+            templeOuterPolylinePxRoi = templeOuterPolylinePxRoi,
+            bottomArcWindow = bottomArcWindow,
+            bottomConfidence = bottomConfidence,
+            lateralConfidence = lateralConfidence,
+            contractConfidence = contractConfidence
         )
     }
 
-    // ============================================================
-    // 2) px/mm OFICIAL DESDE FIT (FIL colocado) en ejes del MODELO
-    // ============================================================
     fun pxMmFromFit3250(
         fit: FilPlaceFromArc3250.Fit3250,
         filHboxMm: Double,
         filVboxMm: Double,
         filOverInnerMmPerSide3250: Double,
+        profile3250: RimProfile3250,
         tolRelXY: Double = 0.10
     ): PxMmPack3250? {
 
-        val over = filOverInnerMmPerSide3250.takeIf { it.isFinite() } ?: 0.5
-        val overClamped = over.coerceIn(0.0, 2.0)
+        val effectiveOver = effectiveFilOverPerSide3250(
+            profile3250,
+            filOverInnerMmPerSide3250
+        )
+
+        val overClamped = effectiveOver.coerceIn(0.0, 2.0)
 
         val hboxInnerMm = (filHboxMm - 2.0 * overClamped).coerceAtLeast(10.0)
         val vboxInnerMm = (filVboxMm - 2.0 * overClamped).coerceAtLeast(10.0)
@@ -201,8 +411,6 @@ object ArcFitAdapter3250 {
         var minY = Double.POSITIVE_INFINITY
         var maxY = Double.NEGATIVE_INFINITY
 
-        // Convertimos cada punto ROI (x,y down) a Up-rel, y lo “desrotamos” a ejes de modelo:
-        // qRelUp = (dx, dyUp), luego qModel = R(-theta)*qRelUp
         for (p in fit.placedPxRoi) {
             val dx = (p.x - fit.originPxRoi.x).toDouble()
             val dyUp = (-(p.y - fit.originPxRoi.y)).toDouble()
@@ -210,8 +418,10 @@ object ArcFitAdapter3250 {
             val xModel = c * dx + s * dyUp
             val yModel = -s * dx + c * dyUp
 
-            minX = min(minX, xModel); maxX = max(maxX, xModel)
-            minY = min(minY, yModel); maxY = max(maxY, yModel)
+            minX = min(minX, xModel)
+            maxX = max(maxX, xModel)
+            minY = min(minY, yModel)
+            maxY = max(maxY, yModel)
         }
 
         val spanX = (maxX - minX).takeIf { it.isFinite() && it > 1e-6 } ?: return null
@@ -234,9 +444,6 @@ object ArcFitAdapter3250 {
         )
     }
 
-    // ============================================================
-    // 3) INNER en la línea bridgeRow (GLOBAL) usando el FIL colocado
-    // ============================================================
     fun innerAtBridgeRowFromFit3250(
         fit: FilPlaceFromArc3250.Fit3250,
         roiGlobal: RectF,
@@ -244,10 +451,26 @@ object ArcFitAdapter3250 {
         eyeSideSign3250: Int,
         midlineXpxGlobal: Float? = null
     ): InnerAtY3250? {
+        return innerAtRowFromFit3250(
+            fit = fit,
+            roiGlobal = roiGlobal,
+            rowYpxGlobal = bridgeRowYpxGlobal,
+            eyeSideSign3250 = eyeSideSign3250,
+            midlineXpxGlobal = midlineXpxGlobal
+        )
+    }
+
+    fun innerAtRowFromFit3250(
+        fit: FilPlaceFromArc3250.Fit3250,
+        roiGlobal: RectF,
+        rowYpxGlobal: Float,
+        eyeSideSign3250: Int,
+        midlineXpxGlobal: Float? = null
+    ): InnerAtY3250? {
 
         if (fit.placedPxRoi.isEmpty()) return null
 
-        val yRoi = (bridgeRowYpxGlobal - roiGlobal.top)
+        val yRoi = rowYpxGlobal - roiGlobal.top
         if (!yRoi.isFinite()) return null
 
         val xs = intersectPolyWithHLineXs3250(fit.placedPxRoi, yRoi)
@@ -256,45 +479,165 @@ object ArcFitAdapter3250 {
         val xL = xs.first()
         val xR = xs.last()
 
-        val xL_g = (xL + roiGlobal.left)
-        val xR_g = (xR + roiGlobal.left)
+        val xLGlobal = xL + roiGlobal.left
+        val xRGlobal = xR + roiGlobal.left
 
-        // nasal = hacia midline
         val nasal = run {
             if (midlineXpxGlobal != null && midlineXpxGlobal.isFinite()) {
-                val dL = abs(xL_g - midlineXpxGlobal)
-                val dR = abs(xR_g - midlineXpxGlobal)
-                if (dL <= dR) xL_g else xR_g
+                val dL = abs(xLGlobal - midlineXpxGlobal)
+                val dR = abs(xRGlobal - midlineXpxGlobal)
+                if (dL <= dR) xLGlobal else xRGlobal
             } else {
-                // fallback por lado: OD(-1) nasal es el de la derecha (hacia midline),
-                // OI(+1) nasal es el de la izquierda.
-                if (eyeSideSign3250 < 0) xR_g else xL_g
+                if (eyeSideSign3250 < 0) xRGlobal else xLGlobal
             }
         }
 
-        val temple = if (nasal == xL_g) xR_g else xL_g
+        val temple = if (nasal == xLGlobal) xRGlobal else xLGlobal
 
         return InnerAtY3250(
-            yGlobal = bridgeRowYpxGlobal,
-            innerLeftXGlobal = xL_g,
-            innerRightXGlobal = xR_g,
+            yGlobal = rowYpxGlobal,
+            innerLeftXGlobal = xLGlobal,
+            innerRightXGlobal = xRGlobal,
             nasalXGlobal = nasal,
             templeXGlobal = temple
         )
     }
 
-    // ============================================================
-    // Helpers geom
-    // ============================================================
-    private fun intersectPolyWithHLineXs3250(poly: List<PointF>, y: Float): FloatArray {
+    private fun computeBottomConfidence3250(
+        bottomPolylineRoi: List<PointF>,
+        wRoi: Int
+    ): Float {
+        if (bottomPolylineRoi.size < 2 || wRoi <= 0) return 0f
+
+        val sorted = bottomPolylineRoi.sortedBy { it.x }
+        val xSpan = (sorted.last().x - sorted.first().x).coerceAtLeast(0f)
+        val spanFrac = (xSpan / wRoi.toFloat()).coerceIn(0f, 1f)
+        val nScore = (bottomPolylineRoi.size / 48f).coerceIn(0f, 1f)
+
+        return (0.70f * spanFrac + 0.30f * nScore).coerceIn(0f, 1f)
+    }
+
+    private fun computeLateralConfidence3250(
+        nasalInnerPolylineRoi: List<PointF>,
+        templeInnerPolylineRoi: List<PointF>,
+        nasalXAtAnchorRoi: Float?,
+        templeXAtAnchorRoi: Float?,
+        anchorYpxRoi: Float,
+        hRoi: Int
+    ): Float {
+        if (hRoi <= 0) return 0f
+
+        val nScore = polylineAnchorSupport3250(
+            pts = nasalInnerPolylineRoi,
+            anchorY = anchorYpxRoi,
+            hRoi = hRoi
+        )
+
+        val tScore = polylineAnchorSupport3250(
+            pts = templeInnerPolylineRoi,
+            anchorY = anchorYpxRoi,
+            hRoi = hRoi
+        )
+
+        val xCrossScore = when {
+            nasalXAtAnchorRoi != null && templeXAtAnchorRoi != null -> 1f
+            nasalXAtAnchorRoi != null || templeXAtAnchorRoi != null -> 0.5f
+            else -> 0f
+        }
+
+        return (0.40f * nScore + 0.40f * tScore + 0.20f * xCrossScore).coerceIn(0f, 1f)
+    }
+
+    private fun polylineAnchorSupport3250(
+        pts: List<PointF>,
+        anchorY: Float,
+        hRoi: Int
+    ): Float {
+        if (pts.size < 2 || hRoi <= 0) return 0f
+
+        val sorted = pts.sortedBy { it.y }
+        val ySpan = (sorted.last().y - sorted.first().y).coerceAtLeast(0f)
+        val spanFrac = (ySpan / hRoi.toFloat()).coerceIn(0f, 1f)
+
+        val yMin = sorted.first().y
+        val yMax = sorted.last().y
+        val crosses = anchorY in yMin..yMax
+
+        val nScore = (pts.size / 36f).coerceIn(0f, 1f)
+        val crossScore = if (crosses) 1f else 0f
+
+        return (0.40f * spanFrac + 0.30f * nScore + 0.30f * crossScore).coerceIn(0f, 1f)
+    }
+
+    private fun localPolylineToRoi3250(
+        ptsGlobal: List<PointF>?,
+        roiGlobal: RectF
+    ): List<PointF> {
+        if (ptsGlobal.isNullOrEmpty()) return emptyList()
+        return ptsGlobal.map { p -> PointF(p.x - roiGlobal.left, p.y - roiGlobal.top) }
+    }
+
+    private fun localPolylineToRoi3250Nullable(
+        ptsGlobal: List<PointF>?,
+        roiGlobal: RectF
+    ): List<PointF>? {
+        if (ptsGlobal.isNullOrEmpty()) return null
+        return ptsGlobal.map { p -> PointF(p.x - roiGlobal.left, p.y - roiGlobal.top) }
+    }
+
+    private fun intersectPolylineWithHLineX3250(
+        pts: List<PointF>,
+        y: Float
+    ): Float? {
+        if (pts.size < 2 || !y.isFinite()) return null
+
+        var bestX: Float? = null
+        var bestDy = Float.MAX_VALUE
+
+        for (i in 1 until pts.size) {
+            val a = pts[i - 1]
+            val b = pts[i]
+
+            val y0 = a.y
+            val y1 = b.y
+            val crosses = (y0 <= y && y <= y1) || (y1 <= y && y <= y0)
+            if (!crosses) continue
+
+            val dySeg = y1 - y0
+            if (abs(dySeg) < 1e-6f) {
+                val yc = 0.5f * (y0 + y1)
+                val d = abs(yc - y)
+                if (d < bestDy) {
+                    bestDy = d
+                    bestX = 0.5f * (a.x + b.x)
+                }
+                continue
+            }
+
+            val t = (y - y0) / dySeg
+            if (t < 0f || t > 1f) continue
+
+            val x = a.x + t * (b.x - a.x)
+            if (0f <= bestDy) {
+                bestDy = 0f
+                bestX = x
+            }
+        }
+
+        return bestX
+    }
+
+    private fun intersectPolyWithHLineXs3250(
+        poly: List<PointF>,
+        y: Float
+    ): FloatArray {
         if (poly.size < 3) return floatArrayOf()
 
         val xs = ArrayList<Float>(8)
         val n = poly.size
 
         fun addX(x: Float) {
-            if (!x.isFinite()) return
-            xs.add(x)
+            if (x.isFinite()) xs.add(x)
         }
 
         for (i in 0 until n) {
@@ -303,11 +646,10 @@ object ArcFitAdapter3250 {
             val y0 = a.y
             val y1 = b.y
 
-            // cruce half-open para evitar duplicados en vértices
             val crosses = (y0 <= y && y < y1) || (y1 <= y && y < y0)
             if (!crosses) continue
 
-            val dy = (y1 - y0)
+            val dy = y1 - y0
             if (abs(dy) < 1e-6f) continue
 
             val t = (y - y0) / dy
@@ -318,55 +660,54 @@ object ArcFitAdapter3250 {
         if (xs.size < 2) return floatArrayOf()
 
         xs.sort()
-        // colapsa casi-duplicados
+
         val out = ArrayList<Float>(xs.size)
         var last = Float.NaN
         for (x in xs) {
             if (!last.isFinite() || abs(x - last) > 0.75f) {
-                out.add(x); last = x
+                out.add(x)
+                last = x
             }
         }
+
         if (out.size < 2) return floatArrayOf()
         return floatArrayOf(out.first(), out.last())
     }
 
-    // ------------------------------------------------------------
-    // Ventana angular por arco inferior desde bottomPolyline
-    // ------------------------------------------------------------
-    private fun buildBottomArcWindowFromPolyline3250(
-        bottomPolylineGlobal: List<PointF>?,
-        roiGlobal: RectF,
+    private fun buildBottomArcWindowFromPolylineRoi3250(
+        bottomPolylineRoi: List<PointF>,
         originPxRoi: PointF,
         eyeSideSign3250: Int,
         expandDeg: Double,
-        minLenDeg: Double = 40.0,     // mínimo arco permitido
-        gapSplitDeg: Double = 10.0,   // gap para cortar “nichos”
-        maxDistToBottomDeg: Double = 55.0, // si el cluster no contiene 270 y está lejos → fallback
-        maxLenDeg: Double = 200.0     // cap para no abrir ventanas gigantes
+        minLenDeg: Double = 40.0,
+        gapSplitDeg: Double = 10.0,
+        maxDistToBottomDeg: Double = 55.0,
+        maxLenDeg: Double = 200.0
     ): ArcWindow3250? {
 
-        val poly = bottomPolylineGlobal ?: return null
-        if (poly.size < 3) return null
+        if (bottomPolylineRoi.size < 3) return null
 
-        // 1) poly GLOBAL -> ROI + deg modelo (unwrapped)
-        val degs = ArrayList<Double>(poly.size)
-        for (p in poly) {
-            val qRoi = PointF(p.x - roiGlobal.left, p.y - roiGlobal.top)
-            val d = degFromPointRoi3250(qRoi, originPxRoi, eyeSideSign3250)
-
-            // unwrap alrededor del wrap 0°: lo que cae 0..90 lo llevamos a 360..450
+        val degs = ArrayList<Double>(bottomPolylineRoi.size)
+        for (p in bottomPolylineRoi) {
+            val d = degFromPointRoi3250(
+                qRoi = p,
+                originRoi = originPxRoi,
+                eyeSideSign3250 = eyeSideSign3250
+            )
             val du = if (d < 180.0) d + 360.0 else d
             degs.add(du)
         }
+
         if (degs.size < 3) return null
         degs.sort()
 
-        // 2) clusters por continuidad (nichos)
         data class Cl(val a: Double, val b: Double, val n: Int)
+
         val clusters = ArrayList<Cl>()
         var a0 = degs[0]
         var prev = degs[0]
         var n0 = 1
+
         for (i in 1 until degs.size) {
             val cur = degs[i]
             if (cur - prev > gapSplitDeg) {
@@ -379,6 +720,7 @@ object ArcFitAdapter3250 {
             prev = cur
         }
         clusters.add(Cl(a0, prev, n0))
+
         if (clusters.isEmpty()) return null
 
         fun distToInterval(x: Double, lo: Double, hi: Double): Double =
@@ -388,11 +730,11 @@ object ArcFitAdapter3250 {
                 else -> 0.0
             }
 
-        // 3) elegir cluster: contiene 270 primero; si no, el más cercano (con soporte)
         var best: Cl? = null
         var bestScore = Double.NEGATIVE_INFINITY
+
         for (c in clusters) {
-            val contains = (BOTTOM_DEG in c.a..c.b)
+            val contains = BOTTOM_DEG in c.a..c.b
             val dist = distToInterval(BOTTOM_DEG, c.a, c.b)
             val score = (if (contains) 1e6 else 0.0) + (c.n * 1000.0) - (dist * 10.0)
             if (score > bestScore) {
@@ -400,17 +742,15 @@ object ArcFitAdapter3250 {
                 best = c
             }
         }
-        val c0 = best ?: return null
 
-        val containsBottom = (BOTTOM_DEG in c0.a..c0.b)
+        val c0 = best ?: return null
+        val containsBottom = BOTTOM_DEG in c0.a..c0.b
         val distBottom = distToInterval(BOTTOM_DEG, c0.a, c0.b)
 
-        // 4) ventana base (unwrapped)
         var fromU: Double
         var toU: Double
 
         if (!containsBottom && distBottom > maxDistToBottomDeg) {
-            // fallback: ventana explícita centrada en 270
             val minLen = minLenDeg.coerceIn(20.0, 140.0)
             val half = 0.5 * minLen
             fromU = BOTTOM_DEG - half
@@ -420,38 +760,31 @@ object ArcFitAdapter3250 {
             toU = c0.b
         }
 
-        // 5) asegurar mínimo largo (pero SIN perder el bottom)
         val minLen = minLenDeg.coerceIn(20.0, 140.0)
         var lenU = (toU - fromU).coerceAtLeast(1e-6)
+
         if (lenU < minLen) {
             val mid = if (BOTTOM_DEG in fromU..toU) 0.5 * (fromU + toU) else BOTTOM_DEG
             val half = 0.5 * minLen
             fromU = mid - half
             toU = mid + half
-            lenU = (toU - fromU)
+            lenU = toU - fromU
         }
 
-        // 6) cap para no abrir ventanas gigantes
         if (lenU > maxLenDeg) {
-            val mid = BOTTOM_DEG
             val half = 0.5 * maxLenDeg
-            fromU = mid - half
-            toU = mid + half
-            lenU = (toU - fromU)
+            fromU = BOTTOM_DEG - half
+            toU = BOTTOM_DEG + half
         }
 
-        // 7) expand extra (tu knob)
         val exp = expandDeg.coerceIn(0.0, 40.0)
         fromU -= exp
         toU += exp
 
-        // 8) volver a [0..360)
         val from = normDeg3250(fromU)
         val to = normDeg3250(toU)
 
-        // 9) validación dura: tiene que incluir 270 en el arco from->to (con wrap)
         if (!containsOnArc3250(BOTTOM_DEG, from, to)) {
-            // fallback último recurso: ventana explícita alrededor de 270
             val half = 0.5 * minLen
             val f = normDeg3250(BOTTOM_DEG - half - exp)
             val t = normDeg3250(BOTTOM_DEG + half + exp)
@@ -474,27 +807,33 @@ object ArcFitAdapter3250 {
 
     private fun normDeg3250(d: Double): Double {
         val a = d % 360.0
-        return if (a < 0) a + 360.0 else a
+        return if (a < 0.0) a + 360.0 else a
     }
 
-    private fun containsOnArc3250(target: Double, from: Double, to: Double): Boolean {
+    private fun containsOnArc3250(
+        target: Double,
+        from: Double,
+        to: Double
+    ): Boolean {
         val t = normDeg3250(target)
         val a = normDeg3250(from)
         val b = normDeg3250(to)
-        return if (a <= b) (t in a..b) else (t >= a || t <= b) // wrap
+        return if (a <= b) {
+            t in a..b
+        } else {
+            t >= a || t <= b
+        }
     }
 
-    private fun arcLen3250(from: Double, to: Double): Double {
+    private fun arcLen3250(
+        from: Double,
+        to: Double
+    ): Double {
         val a = normDeg3250(from)
         val b = normDeg3250(to)
         return (b - a + 360.0) % 360.0
     }
 
-    /**
-     * Convierte un punto ROI (x,y down) a “deg del modelo” de ArcFit:
-     * - Y se pasa a Up (dyUp = -(y-origin.y))
-     * - X se pasa a “eje nasal” usando nasalUxFixed = -eyeSideSign
-     */
     private fun degFromPointRoi3250(
         qRoi: PointF,
         originRoi: PointF,
@@ -510,4 +849,16 @@ object ArcFitAdapter3250 {
         val ang = Math.toDegrees(atan2(dyUp, xNasal))
         return normDeg3250(ang)
     }
+
+    private fun f1(v: Double?): String =
+        if (v == null || !v.isFinite()) "NaN" else "%.1f".format(v)
+
+    private fun f2(v: Float?): String =
+        if (v == null || !v.isFinite()) "NaN" else "%.2f".format(v)
+
+    private fun f3(v: Float?): String =
+        if (v == null || !v.isFinite()) "NaN" else "%.3f".format(v)
+
+    private fun f4(v: Double?): String =
+        if (v == null || !v.isFinite()) "NaN" else "%.4f".format(v)
 }

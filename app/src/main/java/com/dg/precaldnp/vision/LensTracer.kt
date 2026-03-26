@@ -5,18 +5,24 @@ import android.graphics.PointF
 import android.util.Log
 import com.dg.precaldnp.model.PrecalMetrics
 import org.opencv.android.Utils
-import org.opencv.core.*
+import org.opencv.core.Core
+import org.opencv.core.CvType
+import org.opencv.core.Mat
+import org.opencv.core.MatOfDouble
+import org.opencv.core.MatOfPoint
+import org.opencv.core.MatOfPoint2f
+import org.opencv.core.Point
+import org.opencv.core.Scalar
+import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
-import kotlin.math.*
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.hypot
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
+import kotlin.math.sin
 
-/**
- * Trazador de lente dentro del aro Ø75.
- * - Detecta el círculo de referencia (Ø75 impreso) con Hough (prioriza radio esperado).
- * - Construye ROI interior excluyendo una banda alrededor del aro (para no “tomar” el aro).
- * - Búsqueda principal: barrido radial desde afuera→adentro con suavizado anti-serrucho.
- * - Oversampling angular: se muestrea fino (p.ej. 2400 radiales) y se resume a 800.
- * - Fallback: mayor contorno útil en ROI si el radial no llega a cobertura mínima.
- */
 object LensTracer {
 
     private const val TAG = "Precal/LensTracer"
@@ -33,25 +39,42 @@ object LensTracer {
     private const val FALLBACK_MAX_POINTS = 2000
 
     data class Params(
+        // El círculo impreso de tu plantilla (Ø100 por defecto)
+        val circleDiamMm: Float = 100f,
+
+        // ROI: disco interior y banda a excluir alrededor del aro
         val marginMmInside: Float = 6f,
         val ringBandMmExclude: Float = 3.0f,
+
+        // bordes
         val cannyLow: Int = 40,
         val cannyHigh: Int = 120,
+
+        // radial principal
         val minCoverageRadial: Float = 0.60f,
-        val approxEpsRel: Float = 0.001f,
-        val maxCircularity: Float = 0.92f,
-        val minAreaRatio: Float = 0.02f,
-        val maxAreaRatio: Float = 0.85f,
+
+        // limpieza/continuidad
+        val maxJumpMm: Float = 0.2f,
+
+        // prepro
         val clahe: Boolean = true,
         val sharpen: Boolean = true,
 
-        // continuidad (mm) usada para clamp / limpieza
-        val maxJumpMm: Float = 0.2f,
-
         // Anti-reflejos
-        val highlightThr: Double = 280.0,     // umbral de “casi blanco”
-        val highlightDilate: Int = 3,         // cuánto agrandar la máscara
-        val highlightFillGray: Double = 180.0 // qué valor meter en zonas brillantes
+        val highlightThr: Double = 235.0,
+        val highlightDilate: Int = 3,
+        val highlightFillGray: Double = 180.0,
+
+        // diámetro “seguro” desde donde arranca el radial
+        val scanDiamMm: Float = 92f,
+
+        // legacy / reservados
+        val refineCenter: Boolean = true,
+        val refineCenterSearchFrac: Float = 0.06f,
+        val refineCoarseStepPx: Int = 3,
+        val refineFineStepPx: Int = 1,
+        val refineCoarseStepDeg: Int = 6,
+        val refineFineStepDeg: Int = 3
     )
 
     fun trace(
@@ -59,15 +82,22 @@ object LensTracer {
         pxPerMm: Float,
         cameraId: String,
         zoom: Float,
+        refCircle: RefCalibrator75.Ref75? = null,
         params: Params = Params()
     ): PrecalMetrics? {
         val srcRgba = Mat()
         Utils.bitmapToMat(bitmap, srcRgba)
+
         val bgr = Mat()
         Imgproc.cvtColor(srcRgba, bgr, Imgproc.COLOR_RGBA2BGR)
         srcRgba.release()
 
-        val out = traceBgr(bgr, pxPerMm, params)
+        val out = traceBgr(
+            matBgr = bgr,
+            pxPerMm = pxPerMm,
+            params = params,
+            refCircle = refCircle
+        )
         bgr.release()
 
         return out?.copy(cameraId = cameraId, zoom = zoom)
@@ -76,149 +106,178 @@ object LensTracer {
     fun traceBgr(
         matBgr: Mat,
         pxPerMm: Float,
-        params: Params = Params()
+        params: Params = Params(),
+        refCircle: RefCalibrator75.Ref75? = null
     ): PrecalMetrics? {
 
         val bufW = matBgr.cols()
         val bufH = matBgr.rows()
 
-        // -------- Prepro base --------
-        val gray = Mat()
-        Imgproc.cvtColor(matBgr, gray, Imgproc.COLOR_BGR2GRAY)
+        // Si viene del calibrador pro, usamos SU escala oficial.
+        val pxPerMmUsed = refCircle?.pxPerMm?.takeIf { it > 0f } ?: pxPerMm
+
+        Log.d(
+            TAG,
+            "TRACE_IN pxArg=%.4f pxUse=%.4f ref(cx=%.1f cy=%.1f r=%.1f pxX=%.4f pxY=%.4f th=%.2f)"
+                .format(
+                    pxPerMm,
+                    pxPerMmUsed,
+                    refCircle?.cx ?: Float.NaN,
+                    refCircle?.cy ?: Float.NaN,
+                    refCircle?.rPx ?: Float.NaN,
+                    refCircle?.pxPerMmX ?: Float.NaN,
+                    refCircle?.pxPerMmY ?: Float.NaN,
+                    refCircle?.thetaPageDeg ?: Float.NaN
+                )
+        )
+
+        // -------- Prepro base (FULL) --------
+        val grayFull = Mat()
+        Imgproc.cvtColor(matBgr, grayFull, Imgproc.COLOR_BGR2GRAY)
 
         if (params.clahe) {
             val clahe = Imgproc.createCLAHE(2.0, Size(8.0, 8.0))
-            clahe.apply(gray, gray)
+            clahe.apply(grayFull, grayFull)
         }
 
         if (params.sharpen) {
             val blur = Mat()
-            Imgproc.GaussianBlur(gray, blur, Size(0.0, 0.0), 1.0)
-            Core.addWeighted(gray, 1.5, blur, -0.5, 0.0, gray)
+            Imgproc.GaussianBlur(grayFull, blur, Size(0.0, 0.0), 1.0)
+            Core.addWeighted(grayFull, 1.5, blur, -0.5, 0.0, grayFull)
             blur.release()
         }
 
-        Imgproc.GaussianBlur(gray, gray, Size(5.0, 5.0), 0.0)
+        Imgproc.GaussianBlur(grayFull, grayFull, Size(5.0, 5.0), 0.0)
 
         // -------- Anti-reflejos (aplanar highlights) --------
         val highlights = Mat()
-        Imgproc.threshold(gray, highlights, params.highlightThr, 255.0, Imgproc.THRESH_BINARY)
+        Imgproc.threshold(grayFull, highlights, params.highlightThr, 255.0, Imgproc.THRESH_BINARY)
         val k3 = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(3.0, 3.0))
         Imgproc.morphologyEx(highlights, highlights, Imgproc.MORPH_CLOSE, k3)
         if (params.highlightDilate > 0) {
             Imgproc.dilate(highlights, highlights, k3, Point(-1.0, -1.0), params.highlightDilate)
         }
-        // “Neutralizamos” brillo: evita bordes internos falsos y cortes del borde real
-        gray.setTo(Scalar(params.highlightFillGray), highlights)
-        Imgproc.GaussianBlur(gray, gray, Size(5.0, 5.0), 0.0)
+        grayFull.setTo(Scalar(params.highlightFillGray), highlights)
+        Imgproc.GaussianBlur(grayFull, grayFull, Size(5.0, 5.0), 0.0)
         k3.release()
         highlights.release()
 
-        // -------- Detectar aro Ø75 --------
-        val expectedR = 37.5 * pxPerMm // px
-        val circles = Mat()
-        Imgproc.HoughCircles(
-            gray, circles, Imgproc.HOUGH_GRADIENT,
-            1.2,
-            min(bufW, bufH) * 0.6,
-            160.0,
-            38.0,
-            (min(bufW, bufH) * 0.15).toInt(),
-            (min(bufW, bufH) * 0.49).toInt()
+        // -------- Edges FULL (para el radial de la lente) --------
+        val edgesFull = Mat()
+        Imgproc.Canny(grayFull, edgesFull, params.cannyLow.toDouble(), params.cannyHigh.toDouble())
+        val kClose = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(3.0, 3.0))
+        Imgproc.morphologyEx(edgesFull, edgesFull, Imgproc.MORPH_CLOSE, kClose, Point(-1.0, -1.0), 1)
+        kClose.release()
+
+        val edgesFullU8 = matToU8(edgesFull)
+
+        // -------- Círculo de referencia: usar el del calibrador si existe --------
+        val ring = detectRingCircleForRoi(
+            grayFull = grayFull,
+            pxPerMmFull = pxPerMmUsed,
+            params = params,
+            refCircle = refCircle
         )
 
-        if (circles.empty()) {
-            gray.release(); circles.release()
+        if (ring == null) {
+            grayFull.release()
+            edgesFull.release()
             return null
         }
 
-        var refCx = 0f
-        var refCy = 0f
-        var refR = 0f
-        run {
-            val cxImg = bufW * 0.5
-            val cyImg = bufH * 0.5
-            var bestScore = Double.NEGATIVE_INFINITY
-            for (i in 0 until circles.cols()) {
-                val c = circles.get(0, i) ?: continue
-                val x = c[0]; val y = c[1]; val r = c[2]
-                val dr = -abs(r - expectedR)
-                val dc = -hypot(x - cxImg, y - cyImg)
-                val score = dr * 0.8 + dc * 0.2
-                if (score > bestScore) {
-                    bestScore = score
-                    refCx = x.toFloat()
-                    refCy = y.toFloat()
-                    refR = r.toFloat()
-                }
-            }
-        }
-        circles.release()
+        val refCx = ring.cxFull
+        val refCy = ring.cyFull
+        val detRpx = ring.detRFull
+        val useRpx = ring.useRFull
 
-        // -------- ROI interior (disco) y exclusión de banda en torno al aro --------
-        val marginPx = (params.marginMmInside * pxPerMm).coerceAtLeast(2f)
-        val roiR = max(8f, refR - marginPx)
+        // -------- ROI interior (disco) + CAP configurable --------
+        val marginPx = (params.marginMmInside * pxPerMmUsed).coerceAtLeast(2f)
+
+        val scanRatio = (params.scanDiamMm / params.circleDiamMm).coerceIn(0.70f, 0.98f)
+        val capRpx = useRpx * scanRatio
+
+        // ROI final: min(useRpx - margen, capRpx)
+        val roiR = max(8f, min(useRpx - marginPx, capRpx))
 
         val roiMask = Mat.zeros(bufH, bufW, CvType.CV_8UC1)
         Imgproc.circle(
             roiMask,
             Point(refCx.toDouble(), refCy.toDouble()),
-            roiR.toInt(),
+            roiR.roundToInt(),
             Scalar(255.0),
             -1
         )
 
-        val bandPx = (params.ringBandMmExclude * pxPerMm).coerceAtLeast(2f)
+        // -------- Banda a excluir alrededor del aro (useRpx ± bandPx) --------
+        val bandPx = (params.ringBandMmExclude * pxPerMmUsed).coerceAtLeast(2f)
+
         val ringOuter = Mat.zeros(bufH, bufW, CvType.CV_8UC1)
         val ringInner = Mat.zeros(bufH, bufW, CvType.CV_8UC1)
+
+        val rOuterBand = (useRpx + bandPx).coerceAtLeast(2f)
+        val rInnerBand = (useRpx - bandPx).coerceAtLeast(2f)
+
         Imgproc.circle(
             ringOuter,
             Point(refCx.toDouble(), refCy.toDouble()),
-            (refR + bandPx).toInt(),
+            rOuterBand.roundToInt(),
             Scalar(255.0),
             -1
         )
         Imgproc.circle(
             ringInner,
             Point(refCx.toDouble(), refCy.toDouble()),
-            (refR - bandPx).toInt(),
+            rInnerBand.roundToInt(),
             Scalar(255.0),
             -1
         )
+
         val ringBand = Mat()
         Core.subtract(ringOuter, ringInner, ringBand)
         Core.subtract(roiMask, ringBand, roiMask)
-        ringOuter.release(); ringInner.release(); ringBand.release()
 
-        // -------- Bordes en ROI --------
-        val edges = Mat()
-        Imgproc.Canny(gray, edges, params.cannyLow.toDouble(), params.cannyHigh.toDouble())
-        Core.bitwise_and(edges, roiMask, edges)
+        ringOuter.release()
+        ringInner.release()
+        ringBand.release()
 
-        val k = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(3.0, 3.0))
-        Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, k, Point(-1.0, -1.0), 1)
-        k.release()
+        // -------- Veto explícito de gráfica de plantilla --------
+        val templateVeto = buildTemplateVetoMask(
+            w = bufW,
+            h = bufH,
+            cx = refCx,
+            cy = refCy,
+            useRpx = useRpx,
+            thetaPageDeg = refCircle?.thetaPageDeg ?: 0f
+        )
+        Core.subtract(roiMask, templateVeto, roiMask)
+        templateVeto.release()
 
-        // -------- Radial afuera→adentro con SOBRE-MUESTREO --------
-        val rOuter = (min(roiR.toDouble(), (refR - bandPx).toDouble()) -
-                max(1.5, (1.0 * pxPerMm))).coerceAtLeast(4.0)
-        val rMin = roiR * 0.35
+        // -------- Bordes en ROI (FULL) --------
+        val edgesRoiU8 = edgesFullU8.copyOf()
+        applyMaskU8(edgesRoiU8, bufW, bufH, roiMask)
 
-        // OJO: si no hay hit, dejamos NaN (NO rMin), para no achicar con el smoothing
+        // -------- Radial afuera→adentro --------
+        val insetStartPx = max(2.0, (1.0 * pxPerMmUsed).toDouble())
+        val rOuter = (roiR.toDouble() - insetStartPx).coerceAtLeast(4.0)
+        val rMin = max(4.0, rOuter * 0.35)
+
         val rawRFine = DoubleArray(N_RADIALES_FINE) { Double.NaN }
         val hitFine = BooleanArray(N_RADIALES_FINE)
         var hits = 0
 
         for (i in 0 until N_RADIALES_FINE) {
             val theta = -2.0 * Math.PI * i / N_RADIALES_FINE
-            val r = scanRadialOutsideIn(
-                edgesU8 = edges,
+            val r = scanRadialOutsideInU8(
+                edgesU8 = edgesRoiU8,
+                w = bufW,
+                h = bufH,
                 cx = refCx.toDouble(),
                 cy = refCy.toDouble(),
                 theta = theta,
                 rOuter = rOuter,
                 rMin = rMin
             )
+
             if (r != null) {
                 rawRFine[i] = r
                 hitFine[i] = true
@@ -230,107 +289,115 @@ object LensTracer {
 
         val coverageRadial = hits.toFloat() / N_RADIALES_FINE
 
-        val outlinePx: List<PointF> = if (coverageRadial >= params.minCoverageRadial) {
+        val outlinePx: List<PointF> =
+            if (coverageRadial >= params.minCoverageRadial) {
+                val filled = fillMissingCircularLinear(rawRFine, hitFine)
+                val smooth = smoothCircular(filled)
 
-            // 1) Relleno circular por interpolación entre hits vecinos (evita “mordidas” por NaN)
-            val filled = fillMissingCircularLinear(rawRFine, hitFine)
+                val maxJumpPx = (params.maxJumpMm * pxPerMmUsed).coerceAtLeast(1f)
+                val smoothClamped = clampCircularDeltas(smooth, maxJumpPx)
 
-            // 2) Suavizado circular + clamp de deltas (evita spikes por reflejos)
-            val smooth = smoothCircular(filled)
-            val maxJumpPx = (params.maxJumpMm * pxPerMm).coerceAtLeast(1f)
-            val smoothClamped = clampCircularDeltas(smooth, maxJumpPx)
-
-            // 3) Contorno polar (pasamos hitMask = true para usar todos los ángulos ya “sanitizados”)
-            val hitAll = BooleanArray(smoothClamped.size) { true }
-            buildContinuousOutlinePolar(
-                cx = refCx,
-                cy = refCy,
-                radii = smoothClamped,
-                hitMask = hitAll,
-                pxPerMm = pxPerMm,
-                maxJumpMm = max(0.05f, params.maxJumpMm) // guardita
-            )
-
-        } else {
-
-            // Fallback por contorno
-            val contours = mutableListOf<MatOfPoint>()
-            val hierarchy = Mat()
-            Imgproc.findContours(
-                edges,
-                contours,
-                hierarchy,
-                Imgproc.RETR_EXTERNAL,
-                Imgproc.CHAIN_APPROX_NONE
-            )
-            hierarchy.release()
-
-            var best: MatOfPoint? = null
-            var bestScore = -1.0
-            val roiArea = Math.PI * roiR * roiR
-
-            for (cnt in contours) {
-                val area = Imgproc.contourArea(cnt)
-                if (area < 10.0) {
-                    cnt.release(); continue
-                }
-                val m = Imgproc.moments(cnt)
-                val cx = (m.m10 / (m.m00 + 1e-6))
-                val cy = (m.m01 / (m.m00 + 1e-6))
-                val dc = hypot(cx - refCx, cy - refCy)
-                if (dc > roiR * 0.40) {
-                    cnt.release(); continue
-                }
-
-                val cnt2f = MatOfPoint2f(*cnt.toArray())
-                val per = Imgproc.arcLength(cnt2f, true)
-                cnt2f.release()
-                if (per <= 1e-3) {
-                    cnt.release(); continue
-                }
-
-                val circularity = (4.0 * Math.PI * area) / (per * per)
-                val areaRatio = area / roiArea
-                if (areaRatio !in params.minAreaRatio.toDouble()..params.maxAreaRatio.toDouble()) {
-                    cnt.release(); continue
-                }
-                if (circularity > params.maxCircularity) {
-                    cnt.release(); continue
-                }
-
-                val score = areaRatio * (1.0 - circularity)
-                if (score > bestScore) {
-                    best?.release()
-                    best = cnt
-                    bestScore = score
-                } else {
-                    cnt.release()
-                }
-            }
-
-            val pts = if (best != null) {
-                val arr = best.toArray().map { p -> PointF(p.x.toFloat(), p.y.toFloat()) }
-                best.release()
-                arr
+                val hitAll = BooleanArray(smoothClamped.size) { true }
+                buildContinuousOutlinePolar(
+                    cx = refCx,
+                    cy = refCy,
+                    radii = smoothClamped,
+                    hitMask = hitAll,
+                    pxPerMm = pxPerMmUsed,
+                    maxJumpMm = max(0.05f, params.maxJumpMm)
+                )
             } else {
-                emptyList()
+                // Fallback por contorno (sobre edgesRoiU8 ya vetado)
+                val edgesMat = Mat(bufH, bufW, CvType.CV_8UC1)
+                edgesMat.put(0, 0, edgesRoiU8)
+
+                val contours = mutableListOf<MatOfPoint>()
+                val hierarchy = Mat()
+                Imgproc.findContours(
+                    edgesMat,
+                    contours,
+                    hierarchy,
+                    Imgproc.RETR_EXTERNAL,
+                    Imgproc.CHAIN_APPROX_NONE
+                )
+
+                hierarchy.release()
+                edgesMat.release()
+
+                var best: MatOfPoint? = null
+                var bestScore = -1.0
+                val roiArea = Math.PI * roiR.toDouble() * roiR.toDouble()
+
+                for (cnt in contours) {
+                    val area = Imgproc.contourArea(cnt)
+                    if (area < 10.0) {
+                        cnt.release()
+                        continue
+                    }
+
+                    val m = Imgproc.moments(cnt)
+                    val ccx = (m.m10 / (m.m00 + 1e-6))
+                    val ccy = (m.m01 / (m.m00 + 1e-6))
+                    val dc = hypot(ccx - refCx, ccy - refCy)
+                    if (dc > roiR * 0.40) {
+                        cnt.release()
+                        continue
+                    }
+
+                    val cnt2f = MatOfPoint2f(*cnt.toArray())
+                    val per = Imgproc.arcLength(cnt2f, true)
+                    cnt2f.release()
+                    if (per <= 1e-3) {
+                        cnt.release()
+                        continue
+                    }
+
+                    val circularity = (4.0 * Math.PI * area) / (per * per)
+                    val areaRatio = area / roiArea
+
+                    if (areaRatio !in 0.02..0.85) {
+                        cnt.release()
+                        continue
+                    }
+                    if (circularity > 0.92) {
+                        cnt.release()
+                        continue
+                    }
+
+                    val score = areaRatio * (1.0 - circularity)
+                    if (score > bestScore) {
+                        best?.release()
+                        best = cnt
+                        bestScore = score
+                    } else {
+                        cnt.release()
+                    }
+                }
+
+                val pts = if (best != null) {
+                    val arr = best.toArray().map { p -> PointF(p.x.toFloat(), p.y.toFloat()) }
+                    best.release()
+                    arr
+                } else {
+                    emptyList()
+                }
+
+                if (pts.isNotEmpty()) closeAndSubsample(pts) else emptyList()
             }
 
-            if (pts.isNotEmpty()) closeAndSubsample(pts) else emptyList()
-        }
-
-        // -------- Métricas de calidad --------
+        // -------- Métricas de calidad (nitidez en ROI) --------
         val lap = Mat()
-        Imgproc.Laplacian(gray, lap, CvType.CV_32F)
+        Imgproc.Laplacian(grayFull, lap, CvType.CV_32F)
+
         val mean = MatOfDouble()
         val std = MatOfDouble()
         Core.meanStdDev(lap, mean, std, roiMask)
-        val sharp = (std.toArray().firstOrNull() ?: 0.0).toFloat()
-        lap.release(); mean.release(); std.release()
 
-        gray.release()
-        roiMask.release()
-        edges.release()
+        val sharp = (std.toArray().firstOrNull() ?: 0.0).toFloat()
+
+        lap.release()
+        mean.release()
+        std.release()
 
         val ok = outlinePx.isNotEmpty()
         val coverage = if (ok) max(coverageRadial, 0f) else 0f
@@ -338,10 +405,9 @@ object LensTracer {
         // -------- Downsample fino → 800 para radii --------
         val radiiPxRaw: FloatArray =
             if (ok && coverageRadial >= params.minCoverageRadial) {
-                // reconstruimos una serie 2400 limpia y bajamos a 800
                 val filled = fillMissingCircularLinear(rawRFine, hitFine)
                 val smooth = smoothCircular(filled)
-                val maxJumpPx = (params.maxJumpMm * pxPerMm).coerceAtLeast(1f)
+                val maxJumpPx = (params.maxJumpMm * pxPerMmUsed).coerceAtLeast(1f)
                 val smoothClamped = clampCircularDeltas(smooth, maxJumpPx)
 
                 FloatArray(N_RADIALES) { i ->
@@ -354,16 +420,16 @@ object LensTracer {
 
         val radiiMmRaw: FloatArray =
             if (radiiPxRaw.isNotEmpty()) {
-                FloatArray(radiiPxRaw.size) { i -> radiiPxRaw[i] / pxPerMm }
+                FloatArray(radiiPxRaw.size) { i -> radiiPxRaw[i] / pxPerMmUsed }
             } else {
                 floatArrayOf()
             }
 
-        // -------- Limpieza adicional por continuidad en mm (suave, 2 iteraciones) --------
+        // -------- Limpieza adicional por continuidad en mm --------
         val (radiiMm, radiiPx) =
             if (radiiMmRaw.isNotEmpty() && params.maxJumpMm > 0f) {
                 val cleanedMm = cleanRadiiByContinuity(radiiMmRaw, params.maxJumpMm, iterations = 2)
-                val cleanedPx = FloatArray(cleanedMm.size) { i -> cleanedMm[i] * pxPerMm }
+                val cleanedPx = FloatArray(cleanedMm.size) { i -> cleanedMm[i] * pxPerMmUsed }
                 cleanedMm to cleanedPx
             } else {
                 radiiMmRaw to radiiPxRaw
@@ -371,8 +437,12 @@ object LensTracer {
 
         Log.d(
             TAG,
-            "covRadial=${"%.2f".format(coverageRadial)} hits=$hits/$N_RADIALES_FINE  px/mm=${"%.2f".format(pxPerMm)}  refR=${"%.1f".format(refR)} expR=${"%.1f".format(expectedR)}"
+            "ROI Ø${params.circleDiamMm.roundToInt()}: covRadial=${"%.2f".format(coverageRadial)} hits=$hits/$N_RADIALES_FINE px/mm=${"%.2f".format(pxPerMmUsed)} detRpx=${"%.1f".format(detRpx)} useRpx=${"%.1f".format(useRpx)} scanRatio=${"%.2f".format(scanRatio)}"
         )
+
+        roiMask.release()
+        edgesFull.release()
+        grayFull.release()
 
         return PrecalMetrics(
             radiiPx = radiiPx,
@@ -381,7 +451,7 @@ object LensTracer {
             cyPx = refCy,
             bufW = bufW,
             bufH = bufH,
-            pxPerMm = pxPerMm,
+            pxPerMm = pxPerMmUsed,
             cameraId = "back",
             zoom = 1.0f,
             coverage = coverage,
@@ -392,24 +462,135 @@ object LensTracer {
                 else -> if (ok) 0.5f else 0f
             },
             valid = ok,
-            reasonIfInvalid = if (ok) null else "No outline found inside ring",
+            reasonIfInvalid = if (ok) null else "No outline found inside circle ROI",
             outlineBuf = outlinePx.map { Pair(it.x, it.y) }
         )
     }
 
-    // ---------- Helpers ----------
+    private data class RingDet(
+        val cxFull: Float,
+        val cyFull: Float,
+        val detRFull: Float,
+        val useRFull: Float
+    )
 
-    /** Barrido radial desde rOuter hacia adentro. Devuelve r o null si no encuentra. */
-    private fun scanRadialOutsideIn(
-        edgesU8: Mat,
+    /**
+     * MISMA FOTO => el calibrador ya resolvió cx/cy/rPx en coords del bitmap.
+     * Acá SOLO armamos un ROI estable, no “detectamos” nada.
+     */
+    private fun detectRingCircleForRoi(
+        grayFull: Mat,
+        pxPerMmFull: Float,
+        params: Params,
+        refCircle: RefCalibrator75.Ref75? = null
+    ): RingDet? {
+        val wFull = grayFull.cols()
+        val hFull = grayFull.rows()
+        if (wFull <= 8 || hFull <= 8) return null
+
+        val expectedRFull = (0.5f * params.circleDiamMm * pxPerMmFull).coerceAtLeast(8f)
+
+        val cx = (refCircle?.cx ?: (wFull * 0.5f)).coerceIn(0f, (wFull - 1).toFloat())
+        val cy = (refCircle?.cy ?: (hFull * 0.5f)).coerceIn(0f, (hFull - 1).toFloat())
+
+        val detR = refCircle?.rPx?.takeIf { it > 8f } ?: expectedRFull
+
+        val maxFit = min(
+            min(cx, (wFull - 1).toFloat() - cx),
+            min(cy, (hFull - 1).toFloat() - cy)
+        )
+
+        // Si vino radio del calibrador pro, lo usamos como base.
+        // Si no, caemos al esperado por escala.
+        val seedR = if (refCircle != null) detR else expectedRFull
+        val useR = min(seedR, (maxFit * 0.98f).coerceAtLeast(8f))
+
+        Log.d(
+            TAG,
+            "CIRC[TRC] cx=%.1f cy=%.1f detR=%.1f expR=%.1f useR=%.1f"
+                .format(cx, cy, detR, expectedRFull, useR)
+        )
+
+        return RingDet(
+            cxFull = cx,
+            cyFull = cy,
+            detRFull = detR,
+            useRFull = useR
+        )
+    }
+
+    /**
+     * Veto explícito de elementos impresos de plantilla.
+     * - franja baja total (texto muy inferior)
+     * - barra nominal debajo del círculo, rotada según thetaPageDeg
+     */
+    private fun buildTemplateVetoMask(
+        w: Int,
+        h: Int,
+        cx: Float,
+        cy: Float,
+        useRpx: Float,
+        thetaPageDeg: Float
+    ): Mat {
+        val veto = Mat.zeros(h, w, CvType.CV_8UC1)
+
+        // 1) Franja MUY baja
+        val yLow = (cy + useRpx * 0.93f).roundToInt().coerceIn(0, h - 1)
+        Imgproc.rectangle(
+            veto,
+            Point(0.0, yLow.toDouble()),
+            Point((w - 1).toDouble(), (h - 1).toDouble()),
+            Scalar(255.0),
+            -1
+        )
+
+        // 2) Barra esperada, usando la orientación de página del calibrador
+        val theta = Math.toRadians(thetaPageDeg.toDouble())
+        val barCx = cx
+        val barCy = cy + 0.72f * useRpx
+        val halfW = 0.62f * useRpx
+        val halfH = 0.08f * useRpx
+
+        val local = arrayOf(
+            Point(-halfW.toDouble(), -halfH.toDouble()),
+            Point( halfW.toDouble(), -halfH.toDouble()),
+            Point( halfW.toDouble(),  halfH.toDouble()),
+            Point(-halfW.toDouble(),  halfH.toDouble())
+        )
+
+        val pts = ArrayList<Point>(4)
+        for (p in local) {
+            val rx = p.x * cos(theta) - p.y * sin(theta)
+            val ry = p.x * sin(theta) + p.y * cos(theta)
+            pts.add(
+                Point(
+                    (barCx + rx).coerceIn(0.0, (w - 1).toDouble()),
+                    (barCy + ry).coerceIn(0.0, (h - 1).toDouble())
+                )
+            )
+        }
+
+        val poly = MatOfPoint(*pts.toTypedArray())
+        Imgproc.fillConvexPoly(veto, poly, Scalar(255.0))
+        poly.release()
+
+        return veto
+    }
+
+    // =============================================================================================
+    // Core helpers del tracer
+    // =============================================================================================
+
+    private fun scanRadialOutsideInU8(
+        edgesU8: ByteArray,
+        w: Int,
+        h: Int,
         cx: Double,
         cy: Double,
         theta: Double,
         rOuter: Double,
         rMin: Double
     ): Double? {
-        val w = edgesU8.cols()
-        val h = edgesU8.rows()
         val ct = cos(theta)
         val st = sin(theta)
 
@@ -417,19 +598,41 @@ object LensTracer {
         while (r >= rMin) {
             val x = (cx + r * ct).roundToInt()
             val y = (cy + r * st).roundToInt()
+
             if (x in 0 until w && y in 0 until h) {
-                val v = edgesU8.get(y, x)
-                if (v != null && v.isNotEmpty() && v[0] > 0.0) return r
+                val idx = y * w + x
+                if (idx in edgesU8.indices) {
+                    if ((edgesU8[idx].toInt() and 0xFF) != 0) return r
+                }
             }
             r -= RADIAL_STEP_PX
         }
         return null
     }
 
-    /**
-     * Rellena NaN (misses) en un array circular interpolando entre hits vecinos.
-     * Si hay 1 solo hit, replica ese valor en todo el círculo.
-     */
+    private fun applyMaskU8(
+        edgesU8: ByteArray,
+        w: Int,
+        h: Int,
+        maskU8Mat: Mat
+    ) {
+        val mask = matToU8(maskU8Mat)
+
+        val expected = w * h
+        val n = min(min(edgesU8.size, mask.size), expected)
+
+        for (i in 0 until n) {
+            if ((mask[i].toInt() and 0xFF) == 0) {
+                edgesU8[i] = 0
+            }
+        }
+
+        val n2 = min(edgesU8.size, expected)
+        for (i in n until n2) {
+            edgesU8[i] = 0
+        }
+    }
+
     private fun fillMissingCircularLinear(r: DoubleArray, hit: BooleanArray): DoubleArray {
         val n = r.size
         if (n == 0) return r
@@ -448,7 +651,6 @@ object LensTracer {
 
         hitsIdx.sort()
 
-        // recorremos cada segmento entre hit[k] -> hit[k+1], con wrap al final
         for (k in hitsIdx.indices) {
             val i0 = hitsIdx[k]
             val i1 = hitsIdx[(k + 1) % hitsIdx.size]
@@ -457,7 +659,6 @@ object LensTracer {
             val d = (i1 - i0 + n) % n
             if (d == 0) continue
 
-            // llenamos los internos (1..d-1)
             for (t in 1 until d) {
                 val idx = (i0 + t) % n
                 val a = t.toDouble() / d.toDouble()
@@ -468,7 +669,6 @@ object LensTracer {
         return out
     }
 
-    /** Suaviza en círculo: mediana seguida de promedio móvil. */
     private fun smoothCircular(values: DoubleArray): DoubleArray {
         fun wrap(a: DoubleArray, i: Int) = a[(i % a.size + a.size) % a.size]
         val n = values.size
@@ -491,10 +691,6 @@ object LensTracer {
         return out
     }
 
-    /**
-     * Clamp circular de deltas: limita |Ri - Ri-1| a maxDeltaPx.
-     * Hace forward + backward y promedia (suaviza spikes sin achicar).
-     */
     private fun clampCircularDeltas(r: DoubleArray, maxDeltaPx: Float): DoubleArray {
         val n = r.size
         if (n < 3) return r.copyOf()
@@ -521,32 +717,27 @@ object LensTracer {
         return out
     }
 
-    /** Cierra y submuestrea un contorno largo a <= FALLBACK_MAX_POINTS, manteniendo orden. */
     private fun closeAndSubsample(src: List<PointF>): List<PointF> {
         if (src.isEmpty()) return src
-        val maxPoints = FALLBACK_MAX_POINTS
-        val out = ArrayList<PointF>(min(src.size, maxPoints) + 1)
-        if (src.size <= maxPoints) {
+        val out = ArrayList<PointF>(min(src.size, FALLBACK_MAX_POINTS) + 1)
+        if (src.size <= FALLBACK_MAX_POINTS) {
             out.addAll(src)
         } else {
-            val step = src.size.toFloat() / maxPoints.toFloat()
+            val step = src.size.toFloat() / FALLBACK_MAX_POINTS.toFloat()
             var f = 0f
-            while (f < src.size && out.size < maxPoints) {
+            while (f < src.size && out.size < FALLBACK_MAX_POINTS) {
                 out.add(src[f.toInt()])
                 f += step
             }
         }
         if (out.size >= 2) {
-            val a = out.first(); val b = out.last()
+            val a = out.first()
+            val b = out.last()
             if (a.x != b.x || a.y != b.y) out.add(PointF(a.x, a.y))
         }
         return out
     }
 
-    /**
-     * Construye el contorno a partir de radios en polar imponiendo continuidad.
-     * (Ahora se usa con hitMask=true en todos los ángulos si ya “sanitizamos” radii)
-     */
     private fun buildContinuousOutlinePolar(
         cx: Float,
         cy: Float,
@@ -616,6 +807,7 @@ object LensTracer {
                         }
                         offset++
                     }
+
                     if (!found) {
                         idx = (idx + 1) % n
                         visited++
@@ -632,7 +824,6 @@ object LensTracer {
         val out = ArrayList<PointF>(selIdx.size + 1)
         for (i in selIdx) out.add(pointAt(i))
 
-        // cierre si es coherente
         val firstIdxSel = selIdx.first()
         val lastIdxSel = selIdx.last()
         val firstR = radii[firstIdxSel]
@@ -648,9 +839,6 @@ object LensTracer {
         return out
     }
 
-    /**
-     * Limpia picos aislados en radios (mm) por continuidad (circular), con N iteraciones.
-     */
     private fun cleanRadiiByContinuity(
         radiiMm: FloatArray,
         maxJumpMm: Float,
@@ -683,5 +871,18 @@ object LensTracer {
         }
 
         return cur
+    }
+
+    private fun matToU8(m: Mat): ByteArray {
+        val n = (m.total() * m.channels()).toInt()
+        val out = ByteArray(n)
+        if (m.isContinuous) {
+            m.get(0, 0, out)
+        } else {
+            val tmp = m.clone()
+            tmp.get(0, 0, out)
+            tmp.release()
+        }
+        return out
     }
 }

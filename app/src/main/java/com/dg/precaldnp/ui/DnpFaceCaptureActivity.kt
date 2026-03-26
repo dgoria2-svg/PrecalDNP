@@ -53,7 +53,7 @@ class DnpFaceCaptureActivity : ComponentActivity() {
 
         private const val FIL_INNER_REDUCTION_TOTAL_MM_3250 = 1
         private const val FIL_OVER_INNER_MM_PER_SIDE_3250 =
-            FIL_INNER_REDUCTION_TOTAL_MM_3250 / 2.0 // = 0.5 mm por lado
+            FIL_INNER_REDUCTION_TOTAL_MM_3250 / 2.0 // = 0.25 mm por lado
 
         const val EXTRA_CLEANUP_ON_EXIT_3250 = "extra_cleanup_on_exit_3250"
     }

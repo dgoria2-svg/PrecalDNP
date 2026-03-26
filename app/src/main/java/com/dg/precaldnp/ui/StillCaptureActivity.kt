@@ -1,6 +1,3 @@
-// app/src/main/java/com/dg/precaldnp/ui/StillCaptureActivity.kt
-@file:Suppress("DEPRECATION", "SameParameterValue")
-
 package com.dg.precaldnp.ui
 
 import android.Manifest
@@ -12,7 +9,6 @@ import android.graphics.Bitmap
 import android.graphics.ImageDecoder
 import android.graphics.ImageFormat
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
 import android.util.Log
@@ -42,7 +38,6 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
-import androidx.core.graphics.scale
 import androidx.lifecycle.Observer
 import com.dg.precaldnp.R
 import com.dg.precaldnp.model.ShapeTraceResult
@@ -62,6 +57,7 @@ import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import org.opencv.core.Size as CvSize
+
 
 @Suppress("DEPRECATION", "SameParameterValue")
 class StillCaptureActivity : ComponentActivity() {
@@ -244,6 +240,7 @@ class StillCaptureActivity : ComponentActivity() {
                     .onFailure { Log.w(TAG, "Zoom no soportado: ${it.message}") }
 
                 // IMPORTANTE: dejamos AF continuo por defecto (sin forzar LENS_FOCUS_DISTANCE)
+                // Evita desenfoque si la hoja no está exactamente a macro fijo.
             }
         }, exec)
     }
@@ -334,7 +331,9 @@ class StillCaptureActivity : ComponentActivity() {
             bitmap = bmp,
             pxPerMm = pxPerMm,
             cameraId = cameraId,
-            zoom = zoomRatio
+            zoom = zoomRatio,
+            refCircle = ref     // <-- ESTA es la clave
+
         ) ?: return runOnUi {
             showProcessing(false)
             Toast.makeText(this, getString(R.string.precal_toast_trace_fail), Toast.LENGTH_LONG)
@@ -451,9 +450,9 @@ class StillCaptureActivity : ComponentActivity() {
         val cxFull = bestX * invScale
         val cyFull = bestY * invScale
         val diameterPx = 2.0 * rFull
-        val pxPerMm = (diameterPx / 75.0).toFloat()
+        val pxPerMm = (diameterPx / 100.0).toFloat()
 
-        Log.d(TAG, "Hough75 r=$rFull @ ($cxFull,$cyFull) → diamPx=$diameterPx → px/mm=$pxPerMm (score=$bestScore)")
+        Log.d(TAG, "Hough100 r=$rFull @ ($cxFull,$cyFull) → diamPx=$diameterPx → px/mm=$pxPerMm (score=$bestScore)")
 
         return Guide75Detection(
             cxPx = cxFull.toFloat(),
@@ -478,23 +477,14 @@ class StillCaptureActivity : ComponentActivity() {
     @SuppressLint("UseKtx")
     private fun decodeBitmap(uri: Uri, maxDim: Int = 2200): Bitmap? {
         return try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                val source = ImageDecoder.createSource(contentResolver, uri)
-                ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
-                    decoder.isMutableRequired = false
-                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
-                    val w = info.size.width
-                    val h = info.size.height
-                    val scale = if (w >= h) maxDim.toFloat() / w else maxDim.toFloat() / h
-                    if (scale < 1f) decoder.setTargetSize((w * scale).toInt(), (h * scale).toInt())
-                }
-            } else {
-                @Suppress("DEPRECATION")
-                val legacy = MediaStore.Images.Media.getBitmap(contentResolver, uri)
-                val w = legacy.width
-                val h = legacy.height
+            val source = ImageDecoder.createSource(contentResolver, uri)
+            ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                decoder.isMutableRequired = false
+                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                val w = info.size.width
+                val h = info.size.height
                 val scale = if (w >= h) maxDim.toFloat() / w else maxDim.toFloat() / h
-                if (scale < 1f) legacy.scale((w * scale).toInt(), (h * scale).toInt()) else legacy
+                if (scale < 1f) decoder.setTargetSize((w * scale).toInt(), (h * scale).toInt())
             }
         } catch (_: Throwable) { null }
     }

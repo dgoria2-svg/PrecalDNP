@@ -227,6 +227,14 @@ class ResultsActivity : ComponentActivity() {
     private fun buildMetricsText(r: MeasurementResult, orderId: String?): String {
         fun f(x: Double) = if (x.isFinite()) String.format(Locale.US, "%.2f", x) else "-"
 
+        fun prefer(primary: Double, fallback: Double): Double {
+            return if (primary.isFinite()) primary else fallback
+        }
+
+        val hboxMm = prefer(r.filHboxMm3250, r.anchoMm)
+        val vboxMm = prefer(r.filVboxMm3250, r.altoMm)
+        val eyeSizeMm = prefer(r.filEyeSizeMm3250, r.diagMayorMm)
+
         val dnpTotalMm =
             if (r.dnpOdMm.isFinite() && r.dnpOiMm.isFinite()) (r.dnpOdMm + r.dnpOiMm) else Double.NaN
 
@@ -235,17 +243,24 @@ class ResultsActivity : ComponentActivity() {
                 appendLine(getString(R.string.results_line_order_fmt, orderId))
             }
 
-            // A/B/Diag (aro)
-            appendLine(getString(R.string.results_line_main_fmt, f(r.anchoMm), f(r.altoMm), f(r.diagMayorMm)))
+            // A / B / Diag desde FIL
+            appendLine(
+                getString(
+                    R.string.results_line_main_fmt,
+                    f(hboxMm),
+                    f(vboxMm),
+                    f(eyeSizeMm)
+                )
+            )
 
-            // puente
+            // Puente desde foto
             appendLine(getString(R.string.results_line_bridge_fmt, f(r.puenteMm)))
 
-            // DNP
+            // DNP desde foto
             appendLine(getString(R.string.results_line_dnp_fmt, f(r.dnpOdMm), f(r.dnpOiMm)))
             appendLine(getString(R.string.results_line_dnp_total_fmt, f(dnpTotalMm)))
 
-            // alturas
+            // Alturas desde foto
             appendLine(getString(R.string.results_line_alt_fmt, f(r.altOdMm), f(r.altOiMm)))
 
             // Ø útil

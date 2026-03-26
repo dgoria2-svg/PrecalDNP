@@ -1,6 +1,7 @@
 package com.dg.precaldnp.model
 
 import android.os.Parcelable
+import kotlinx.parcelize.IgnoredOnParcel
 import kotlinx.parcelize.Parcelize
 
 @Parcelize
@@ -8,16 +9,16 @@ data class MeasurementResult(
     val annotatedPath: String,
     val originalPath: String,
 
-    // Métricas del aro derecho
+    // Métricas que muestra ResultsActivity
     val anchoMm: Double,
     val altoMm: Double,
-    val diagMayorMm: Double,
+    val diagMayorMm: Double, // en este flujo: DIAG = FED
 
     // Diámetros útiles por ojo
     val diamUtilOdMm: Double,
     val diamUtilOiMm: Double,
 
-    // DNP por ojo (nasopupilar)
+    // DNP por ojo
     val dnpOdMm: Double,
     val dnpOiMm: Double,
 
@@ -28,20 +29,28 @@ data class MeasurementResult(
     // Puente
     val puenteMm: Double,
 
-    // ---------------- 3250 extras (para dibujar + FIL) ----------------
+    // ---------------- 3250 extras ----------------
     // Escala FINAL usada para el render (mm -> px)
     val pxPerMmFace3250: Double = Double.NaN,
 
-    // Métricas del FIL (lo que querés mostrar)
+    // Métricas del FIL
     val filHboxMm3250: Double = Double.NaN,
     val filVboxMm3250: Double = Double.NaN,
     val filDblMm3250: Double = Double.NaN,
+
+    // LEGACY: este campo hoy transporta FED del FIL
     val filEyeSizeMm3250: Double = Double.NaN,
+
     val filCircMm3250: Double = Double.NaN,
 
-    // Stats útiles para depurar ARC-FIT (opcional, pero vale oro)
+    // Stats útiles para depurar ARC-FIT
     val arcFitRotDeg3250: Double = Double.NaN,
     val arcFitRmsPx3250: Double = Double.NaN,
     val arcFitUsedSamples3250: Int = 0
-) : Parcelable
+) : Parcelable {
 
+    // Alias semántico correcto
+    @IgnoredOnParcel
+    val filFedMm3250: Double
+        get() = filEyeSizeMm3250
+}
